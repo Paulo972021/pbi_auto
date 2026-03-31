@@ -1,4 +1,4 @@
-#pbi_auto_v06.py
+#pbi_auto_v07.py
 """
 Automação Power BI - Scan + Exportação Seletiva de Visuais
 Usa nodriver para:
@@ -11,7 +11,7 @@ Uso:
     1. Cole seu link do Power BI na variável POWERBI_URL
     2. Cole o caminho do navegador na variável BROWSER_PATH
     3. (Opcional) Altere TARGET_PAGE se quiser outra aba
-    4. Execute: python powerbi_export.py
+    4. Execute: python pbi_auto_v07.py
 """
 
 import asyncio
@@ -639,18 +639,23 @@ async def cleanup_residual_ui(tab, stage_label: str, aggressive: bool = False):
         log.info("  ✅ Limpeza aplicada (contagem de overlays indisponível)")
 
 
-async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6, preserve_export_dialog: bool = False) -> bool:
+async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6) -> bool:
     """
-    Fecha popup de confidencialidade sem fechar o diálogo de exportação quando preserve_export_dialog=True.
+    Fecha o popup de 'Você está copiando dados confidenciais' ou semelhantes,
+    sem clicar no link do Microsoft Learn.
+
+    Estratégia:
+    - procura dialog/modal visível
+    - tenta clicar em Fechar/X/Cancelar
+    - se houver botão tipo 'Copiar/Copy', ele NÃO deve ficar acionando em loop
+    - jamais clicar em links 'Saiba mais...' / Learn
     """
     handled_any = False
-    preserve_flag = "true" if preserve_export_dialog else "false"
 
     for _ in range(max_rounds):
         try:
-            result = await tab.evaluate(f"""
-                (() => {{
-                    const PRESERVE_EXPORT_DIALOG = {preserve_flag};
+            result = await tab.evaluate("""
+                (() => {
                     const textOf = (el) => (el?.innerText || el?.textContent || '').trim();
                     const lower = (s) => (s || '').toLowerCase();
 
@@ -662,14 +667,14 @@ async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6, preserve_export
                         '.dialog',
                     ].join(',')));
 
-                    const visibleDialogs = dialogs.filter(d => {{
+                    const visibleDialogs = dialogs.filter(d => {
                         const r = d.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
-                    }});
+                    });
 
                     const allCandidates = [];
 
-                    for (const dlg of visibleDialogs) {{
+                    for (const dlg of visibleDialogs) {
                         const dlgText = lower(textOf(dlg));
                         const isSensitive =
                             dlgText.includes('confidencial') ||
@@ -678,51 +683,71 @@ async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6, preserve_export
                             dlgText.includes('copying data') ||
                             dlgText.includes('exportar dados') ||
                             dlgText.includes('exporting data');
+
                         if (!isSensitive) continue;
 
-                        const looksLikeExportDialog =
-                            dlgText.includes('.xlsx') ||
-                            dlgText.includes('dados resumidos') ||
-                            dlgText.includes('dados subjacentes') ||
-                            dlgText.includes('data with current layout');
-                        if (looksLikeExportDialog && PRESERVE_EXPORT_DIALOG) continue;
-
+                        // Não inclui <a> para impedir clique em "Saiba mais"/Learn.
                         const els = dlg.querySelectorAll('button, [role="button"], [aria-label], [title]');
-                        for (const el of els) {{
+                        for (const el of els) {
                             const txt = lower(textOf(el));
                             const aria = lower(el.getAttribute('aria-label') || '');
                             const title = lower(el.getAttribute('title') || '');
                             const rect = el.getBoundingClientRect();
-                            if (!(rect.width > 0 && rect.height > 0)) continue;
+                            const visible = rect.width > 0 && rect.height > 0;
+                            if (!visible) continue;
 
                             const isLearn =
                                 txt.includes('saiba mais sobre como exportar dados') ||
                                 txt.includes('learn more about exporting data') ||
                                 txt.includes('saiba mais') ||
                                 txt.includes('learn more');
+
                             if (isLearn) continue;
 
-                            allCandidates.push({{ el, txt, aria, title }});
-                        }}
-                    }}
+                            allCandidates.push({
+                                el,
+                                txt,
+                                aria,
+                                title
+                            });
+                        }
+                    }
 
-                    for (const item of allCandidates) {{
-                        const {{ el, txt, aria, title }} = item;
+                    // Prioridade 1: fechar/cancelar/x
+                    for (const item of allCandidates) {
+                        const { el, txt, aria, title } = item;
                         const shouldClose =
-                            txt === 'x' || aria === 'x' || title === 'x' ||
-                            txt.includes('fechar') || txt.includes('close') ||
-                            txt.includes('cancelar') || txt.includes('cancel') ||
-                            aria.includes('fechar') || aria.includes('close') ||
-                            aria.includes('cancelar') || aria.includes('cancel') ||
-                            title.includes('fechar') || title.includes('close');
-                        if (shouldClose) {{
-                            try {{ el.click(); }} catch (e) {{}}
+                            txt === 'x' ||
+                            aria === 'x' ||
+                            title === 'x' ||
+                            txt.includes('fechar') ||
+                            txt.includes('close') ||
+                            txt.includes('cancelar') ||
+                            txt.includes('cancel') ||
+                            aria.includes('fechar') ||
+                            aria.includes('close') ||
+                            aria.includes('cancelar') ||
+                            aria.includes('cancel') ||
+                            title.includes('fechar') ||
+                            title.includes('close');
+
+                        if (shouldClose) {
+                            try { el.click(); } catch (e) {}
                             return "closed";
-                        }}
-                    }}
+                        }
+                    }
+
+                    // Prioridade 2: se não achou botão claro, tenta X genérico visível
+                    for (const item of allCandidates) {
+                        const { el, txt, aria, title } = item;
+                        if (txt === '×' || txt === 'x' || aria === 'x' || title === 'x') {
+                            try { el.click(); } catch (e) {}
+                            return "closed-x";
+                        }
+                    }
 
                     return "";
-                }})()
+                })()
             """)
         except Exception:
             result = ""
@@ -734,6 +759,7 @@ async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6, preserve_export
             await press_escape(tab, times=1, wait_each=0.3)
             continue
 
+        # Se não achou nada explícito, tenta limpeza genérica
         await close_open_menus_and_overlays(tab, aggressive=True)
         await asyncio.sleep(0.8)
         break
@@ -1572,211 +1598,95 @@ async def scan_visuals(tab):
     - tenta abrir 'Mais opções'
     - valida se o menu aberto realmente é do visual
     """
-    log.info("🔎 Escaneando visuais na página (base v5)...")
-    await get_report_dom_context_info(tab, caller="scan_visuals (pré-scan)")
+    log.info("🔎 Escaneando visuais na página...")
     await close_open_menus_and_overlays(tab, aggressive=True)
 
-    # Diagnóstico mínimo obrigatório: provar que o evaluate simples enxerga os visual-containers
-    minimal_raw = await tab.evaluate("""
+    raw = await tab.evaluate("""
         (() => {
-            try {
-                return JSON.stringify({
-                    ok: true,
-                    count: document.querySelectorAll('visual-container').length
+            const textOf = (el) => (el?.innerText || el?.textContent || '').trim();
+
+            const vcs = Array.from(document.querySelectorAll('visual-container'));
+            const results = [];
+
+            vcs.forEach((vc, index) => {
+                const r = vc.getBoundingClientRect();
+
+                if (r.width < 80 || r.height < 50) return;
+
+                const text = textOf(vc);
+                const headerBtn =
+                    vc.querySelector('button[aria-label*="opções"]') ||
+                    vc.querySelector('button[aria-label*="options"]') ||
+                    vc.querySelector('.visual-header-item-container button') ||
+                    vc.querySelector('[class*="visualHeader"] button');
+
+                let title = '';
+
+                const titleCandidates = vc.querySelectorAll([
+                    '[title]',
+                    '.title',
+                    '.headerText',
+                    '.visual-title',
+                    'span',
+                    'div'
+                ].join(','));
+
+                for (const el of titleCandidates) {
+                    const t = textOf(el);
+                    if (!t) continue;
+                    if (t.length < 2) continue;
+
+                    const tl = t.toLowerCase();
+                    if (
+                        tl.includes('exportar dados') ||
+                        tl.includes('mostrar como uma tabela') ||
+                        tl.includes('saiba mais') ||
+                        tl.includes('learn more')
+                    ) {
+                        continue;
+                    }
+
+                    title = t;
+                    break;
+                }
+
+                if (!title) {
+                    title = `Visual #${index + 1}`;
+                }
+
+                results.push({
+                    index,
+                    title,
+                    x: Math.round(r.x),
+                    y: Math.round(r.y),
+                    width: Math.round(r.width),
+                    height: Math.round(r.height),
+                    type: "Tabela",
+                    hasOptionsButton: !!headerBtn,
+                    menuOpened: false,
+                    hasExportData: false,
+                    exportReason: "nao_verificado",
+                    rawText: text.slice(0, 250),
                 });
-            } catch (err) {
-                return JSON.stringify({
-                    ok: false,
-                    error: String(err && err.message ? err.message : err)
-                });
-            }
+            });
+
+            return JSON.stringify(results);
         })()
     """)
-    log.info(f"🧪 [scan_visuals] evaluate mínimo bruto: {minimal_raw}")
-
-    payload_raw = await tab.evaluate("""
-        (() => {
-            try {
-                const results = [];
-                const discardReasons = {};
-                const incDiscard = (reason) => {
-                    discardReasons[reason] = (discardReasons[reason] || 0) + 1;
-                };
-
-                const resolveReportDocument = () => {
-                    const mainCount = document.querySelectorAll('visual-container').length;
-                    if (mainCount > 0) return { doc: document, source: 'document' };
-                    const iframes = Array.from(document.querySelectorAll('iframe'));
-                    for (let i = 0; i < iframes.length; i++) {
-                        try {
-                            const d = iframes[i].contentDocument;
-                            if (!d) continue;
-                            if (d.querySelectorAll('visual-container').length > 0) {
-                                return { doc: d, source: `iframe[${i}]` };
-                            }
-                        } catch (e) {}
-                    }
-                    return { doc: document, source: 'document' };
-                };
-
-                const reportCtx = resolveReportDocument();
-                const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
-                const rawCount = containers.length;
-
-                containers.forEach((vc, index) => {
-                    const el = vc.querySelector('transform') || vc;
-                    if (!el) { incDiscard('no_host_element'); return; }
-
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width < 15 || rect.height < 15) {
-                        incDiscard('tiny_rect(<15x15)');
-                        return;
-                    }
-
-                    let title = '';
-                    let type = 'desconhecido';
-
-                    const headerText = vc.querySelector(
-                        '.slicer-header-text, .visual-title, .visualTitle, [class*="title"], h2, h3, h4'
-                    );
-                    if (headerText) {
-                        title = headerText.textContent?.trim()?.substring(0, 80) || '';
-                    }
-
-                    const ariaLabel = el.getAttribute('aria-label') || vc.getAttribute('aria-label') || '';
-                    if (!title && ariaLabel) {
-                        title = ariaLabel.substring(0, 80);
-                    }
-
-                    const allClasses = [
-                        vc.className || '',
-                        el.className || '',
-                        ...Array.from(vc.querySelectorAll('[class]')).slice(0, 30).map(e => String(e.className || ''))
-                    ].join(' ').toLowerCase();
-
-                    if (allClasses.includes('tablix') || allClasses.includes('table') || allClasses.includes('pivot')) type = 'Tabela';
-                    else if (allClasses.includes('slicer')) type = 'Slicer';
-                    else if (allClasses.includes('card')) type = 'Card';
-                    else if (allClasses.includes('kpi')) type = 'KPI';
-                    else if (allClasses.includes('map')) type = 'Mapa';
-                    else if (allClasses.includes('chart') || allClasses.includes('bar') || allClasses.includes('line')) type = 'Gráfico';
-
-                    if (!title) {
-                        const textContent = el.textContent?.replace(/\\s+/g, ' ').trim()?.substring(0, 100) || '';
-                        if (textContent.length > 5 && textContent.length < 80) title = textContent;
-                    }
-
-                    const optionsBtn = vc.querySelector(
-                        'button[class*="more-options"], button[class*="moreOptions"], ' +
-                        'visual-header-item-container button, visual-container-options-menu button, ' +
-                        'button[aria-label*="opções"], button[aria-label*="options"], ' +
-                        'button[aria-label*="Mais"], button[aria-label*="More"]'
-                    );
-                    const hasHeader = !!vc.querySelector(
-                        'visual-container-header, visual-container-options-menu, visual-header-item-container'
-                    );
-
-                    results.push({
-                        index: index,
-                        title: title || `Visual #${index + 1}`,
-                        type: type,
-                        width: Math.round(rect.width),
-                        height: Math.round(rect.height),
-                        x: Math.round(rect.left),
-                        y: Math.round(rect.top),
-                        hasOptionsButton: !!optionsBtn,
-                        hasHeader: hasHeader,
-                        menuOpened: false,
-                        hasExportData: false,
-                        exportReason: "nao_verificado",
-                        rawText: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 250)
-                    });
-                });
-
-                const withHeaderOrBtn = results.filter(v => v.hasHeader || v.hasOptionsButton).length;
-                return JSON.stringify({
-                    ok: true,
-                    payload: {
-                        visuals: results,
-                        diagnostics: {
-                            contextSource: reportCtx.source,
-                            rawCount,
-                            keptCount: results.length,
-                            withHeaderOrBtn,
-                            discardedCount: rawCount - results.length,
-                            discardReasons
-                        }
-                    }
-                });
-            } catch (err) {
-                return JSON.stringify({
-                    ok: false,
-                    error: String(err && err.message ? err.message : err),
-                    stack: String(err && err.stack ? err.stack : ''),
-                    phase: 'scan_visuals_complex_evaluate'
-                });
-            }
-        })()
-    """)
-    log.info(f"🧪 [scan_visuals] evaluate complexo bruto: {str(payload_raw)[:500]}")
 
     try:
-        payload_wrapper = json.loads(str(payload_raw)) if payload_raw else {}
-    except Exception as exc:
-        log.error(f"❌ [scan_visuals] Falha ao parsear retorno bruto do evaluate: {exc}")
-        log.error(f"❌ [scan_visuals] retorno bruto: {payload_raw}")
+        visuals = json.loads(str(raw))
+    except (json.JSONDecodeError, TypeError):
+        log.error(f"❌ Erro ao parsear visuais: {raw}")
         return []
 
-    if not payload_wrapper.get("ok"):
-        log.error(
-            f"❌ [scan_visuals] erro JS no evaluate ({payload_wrapper.get('phase','?')}): "
-            f"{payload_wrapper.get('error','erro desconhecido')}"
-        )
-        if payload_wrapper.get("stack"):
-            log.error(f"❌ [scan_visuals] stack JS: {payload_wrapper.get('stack')}")
-        return []
+    visuals.sort(key=lambda v: (v.get("y", 0), v.get("x", 0)))
 
-    payload = payload_wrapper.get("payload") or {}
-    visuals = list(payload.get("visuals") or [])
-    diagnostics = payload.get("diagnostics") or {}
-    log.info(f"🧪 [scan_visuals] total no payload bruto: {len(payload.get('visuals') or [])}")
-    log.info(f"🧪 [scan_visuals] total após parse JSON: {len(visuals)}")
-
-    # deduplicação explícita por index para evitar colapsos silenciosos
-    dedup_map = {}
-    for v in visuals:
-        idx = v.get("index")
-        if idx not in dedup_map:
-            dedup_map[idx] = v
-    visuals = list(dedup_map.values())
-    log.info(f"🧪 [scan_visuals] total após deduplicação (index): {len(visuals)}")
-
-    raw_count = int(diagnostics.get("rawCount", 0))
-    kept_count = int(diagnostics.get("keptCount", len(visuals)))
-    discarded_count = int(diagnostics.get("discardedCount", max(0, raw_count - kept_count)))
-    discard_reasons = diagnostics.get("discardReasons", {}) or {}
-    context_source = str(diagnostics.get("contextSource") or "unknown")
-
-    log.info(f"🧪 [diagnóstico] visual-container bruto no DOM: {raw_count} (contexto={context_source})")
-    log.info(f"🧪 [diagnóstico] mantidos no scan: {kept_count} | descartados: {discarded_count}")
-    if discard_reasons:
-        for reason, qty in discard_reasons.items():
-            log.info(f"🧪 [diagnóstico] descarte visual: {reason} = {qty}")
-
-    if raw_count > 0 and kept_count == 0:
-        log.warning("⚠️ Diagnóstico: havia visual-container bruto, mas todos foram descartados pelos filtros.")
-
-    # Evita colapso para 1 item: mantém todos os visuais lidos no payload.
-    exportable = list(visuals)
-    log.info(f"🧪 [scan_visuals] total após filtro final de exibição/exportação: {len(exportable)}")
-
-    exportable.sort(key=lambda v: (0 if v.get('hasOptionsButton') else 1, v.get('y', 0), v.get('x', 0)))
-
-    log.info(f"📊 Total de visual-containers: {len(exportable)}")
-    log.info(f"📋 Visuais com header de opções: {sum(1 for v in exportable if v.get('hasOptionsButton'))}")
+    log.info(f"📊 Total de visual-containers: {len(visuals)}")
+    log.info(f"📋 Visuais com header de opções: {sum(1 for v in visuals if v.get('hasOptionsButton'))}")
     log.info("🔬 Verificando quais visuais suportam 'Exportar dados'...")
 
-    for visual in exportable:
+    for visual in visuals:
         await close_open_menus_and_overlays(tab, aggressive=True)
         await scroll_visual_into_view(tab, visual)
         await hover_visual_center(tab, visual)
@@ -1789,8 +1699,8 @@ async def scan_visuals(tab):
         await close_open_menus_and_overlays(tab, aggressive=True)
         await asyncio.sleep(1)
 
-    log.info(f"✅ {sum(1 for v in exportable if v.get('hasExportData'))} visuais com 'Exportar dados' confirmado")
-    return exportable
+    log.info(f"✅ {sum(1 for v in visuals if v.get('hasExportData'))} visuais com 'Exportar dados' confirmado")
+    return visuals
 
 def display_visuals(visuals: list):
     """Exibe os visuais encontrados na página."""
@@ -1998,28 +1908,6 @@ async def wait_export_dialog(tab, retries: int = 8) -> bool:
     return False
 
 
-async def get_visible_dialog_snapshot(tab) -> list[str]:
-    """Diagnóstico: lista textos resumidos dos dialogs visíveis."""
-    try:
-        raw = await tab.evaluate("""
-            (() => {
-                const isVisible = (el) => {
-                    const r = el.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0;
-                };
-                const dialogs = Array.from(document.querySelectorAll(
-                    '[role="dialog"], [aria-modal="true"], .modal, .popup, .dialog'
-                )).filter(isVisible);
-                const items = dialogs.map(d => (d.innerText || d.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 140));
-                return JSON.stringify(items);
-            })()
-        """)
-        parsed = json.loads(str(raw)) if raw else []
-        return [str(x) for x in parsed]
-    except Exception:
-        return []
-
-
 async def select_export_type(tab) -> bool:
     """
     Seleciona a opção de exportação.
@@ -2216,30 +2104,26 @@ async def export_single_visual(tab, visual) -> bool:
 
     log.info("  ✅ Menu acionado: Exportar dados")
     await asyncio.sleep(MEDIUM_WAIT)
+
+    # trata popup confidencial, se aparecer
+    await dismiss_sensitive_data_popup(tab)
     tab = await ensure_report_tab_still_valid(tab, POWERBI_URL)
-    dialogs_after_export_click = await get_visible_dialog_snapshot(tab)
-    if dialogs_after_export_click:
-        log.info(f"  🧪 Diálogos visíveis após 'Exportar dados': {dialogs_after_export_click[:3]}")
 
     confirmed = False
     for dialog_attempt in range(1, 3):
         dialog_ready = await wait_export_dialog(tab, retries=6 if dialog_attempt == 1 else 4)
         if not dialog_ready:
-            await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
+            await dismiss_sensitive_data_popup(tab)
             log.info(f"  ⚠️ Tentativa {dialog_attempt}/2 sem diálogo de exportação pronto.")
-            snapshot = await get_visible_dialog_snapshot(tab)
-            if snapshot:
-                log.info(f"  🧪 Diálogo(s) ainda visíveis na tentativa {dialog_attempt}: {snapshot[:3]}")
             continue
 
-        # Se diálogo de exportação está pronto, não fechá-lo por engano.
-        await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
+        await dismiss_sensitive_data_popup(tab)
         await select_export_type(tab)
-        await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
+        await dismiss_sensitive_data_popup(tab)
 
         confirmed = await confirm_export_dialog(tab)
         if not confirmed:
-            await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
+            await dismiss_sensitive_data_popup(tab)
             confirmed = await confirm_export_dialog(tab)
 
         if confirmed:
@@ -2423,221 +2307,158 @@ async def scan_slicers(tab):
     - detectar melhor se aparentam ter filtro aplicado
     - não deixar dropdown, tooltip ou painel aberto após a leitura
     """
-    log.info("🎚️ Escaneando filtros/slicers (base v5)...")
-    await get_report_dom_context_info(tab, caller="scan_slicers (pré-scan)")
+    log.info("🎚️ Escaneando filtros/slicers...")
     await cleanup_residual_ui(tab, stage_label="scan de slicers - início", aggressive=True)
 
-    minimal_raw = await tab.evaluate("""
+    slicers_raw = await tab.evaluate("""
         (() => {
-            try {
-                return JSON.stringify({
-                    ok: true,
-                    count: document.querySelectorAll('visual-container').length
-                });
-            } catch (err) {
-                return JSON.stringify({
-                    ok: false,
-                    error: String(err && err.message ? err.message : err)
+            const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+            const lower = (s) => (s || '').toLowerCase();
+            const results = [];
+
+            const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                return r.width > 80 && r.height > 40;
+            };
+
+            const isNoiseText = (txt) => {
+                const t = lower(txt);
+                return (
+                    !t ||
+                    t.includes('saiba mais') ||
+                    t.includes('learn more') ||
+                    t.includes('exportar dados') ||
+                    t.includes('mostrar como uma tabela') ||
+                    t.includes('obter insights')
+                );
+            };
+
+            const classifySlicerType = (vc, txt) => {
+                const t = lower(txt);
+                if (vc.querySelector('input[type="date"], [aria-label*="date"], [aria-label*="data"]')) return 'data';
+                if (vc.querySelector('[aria-checked], [role="checkbox"], [role="option"]')) return 'chiclet';
+                if (vc.querySelector('[role="slider"], input[type="range"]')) return 'intervalo';
+                if (vc.querySelector('select, [role="combobox"], [role="listbox"]')) return 'dropdown';
+                if (t.includes('entre') || t.includes('between')) return 'intervalo';
+                return 'lista';
+            };
+
+            const visualContainers = Array.from(document.querySelectorAll('visual-container'))
+                .map((vc, index) => ({ vc, index }))
+                .filter(({ vc }) => isVisible(vc));
+
+            for (const { vc, index } of visualContainers) {
+                const rect = vc.getBoundingClientRect();
+                const fullText = textOf(vc);
+                const lowerText = lower(fullText);
+
+                const slicerSignals = [
+                    vc.querySelector('[role="listbox"]'),
+                    vc.querySelector('[role="combobox"]'),
+                    vc.querySelector('[role="option"]'),
+                    vc.querySelector('[role="checkbox"]'),
+                    vc.querySelector('[aria-checked]'),
+                    vc.querySelector('.slicer-header-text'),
+                    vc.querySelector('[class*="slicer"]'),
+                    lowerText.includes('pesquisar'),
+                    lowerText.includes('search'),
+                    lowerText.includes('ainda não aplicado'),
+                    lowerText.includes('selecione')
+                ];
+
+                const isLikelySlicer = slicerSignals.some(Boolean);
+                if (!isLikelySlicer) continue;
+
+                // título com prioridade em cabeçalho do slicer
+                let title = '';
+                const titleSelectors = [
+                    '.slicer-header-text',
+                    '[class*="slicer"] [title]',
+                    '[class*="header"] [title]',
+                    'visual-container-header [title]',
+                    '[title]'
+                ];
+                for (const sel of titleSelectors) {
+                    const nodes = vc.querySelectorAll(sel);
+                    for (const el of nodes) {
+                        const t = textOf(el);
+                        if (!t || t.length < 2 || t.length > 80) continue;
+                        if (isNoiseText(t)) continue;
+                        title = t;
+                        break;
+                    }
+                    if (title) break;
+                }
+                if (!title) title = `Slicer #${index + 1}`;
+
+                // indícios de filtro aplicado
+                const selectedNodes = vc.querySelectorAll(
+                    '[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, .checked'
+                );
+                const hasAppliedKeywords =
+                    lowerText.includes(' é ') ||
+                    lowerText.includes('não está em branco') ||
+                    lowerText.includes('selecionad') ||
+                    lowerText.includes('selected') ||
+                    lowerText.includes('múltipl') ||
+                    lowerText.includes('multiple');
+
+                const hasNotAppliedMarker =
+                    lowerText.includes('ainda não aplicado') ||
+                    lowerText.includes('not applied');
+
+                const applied = (selectedNodes.length > 0 || hasAppliedKeywords) && !hasNotAppliedMarker;
+
+                // valores visíveis (sem abrir dropdown/painel)
+                const visibleValues = [];
+                const valueNodes = vc.querySelectorAll(
+                    '[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, ' +
+                    '.slicerText, [role="option"], li, button, span, div'
+                );
+                for (const el of valueNodes) {
+                    const t = textOf(el);
+                    const tl = lower(t);
+                    if (!t || t.length < 1 || t.length > 60) continue;
+                    if (tl === lower(title)) continue;
+                    if (isNoiseText(t)) continue;
+                    if (tl.includes('pesquisar') || tl.includes('search')) continue;
+                    if (tl.includes('ainda não aplicado') || tl.includes('not applied')) continue;
+                    if (!visibleValues.includes(t)) visibleValues.push(t);
+                    if (visibleValues.length >= 8) break;
+                }
+
+                results.push({
+                    index,
+                    title,
+                    type: classifySlicerType(vc, fullText),
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    applied,
+                    values: visibleValues,
+                    hasDropdown: !!vc.querySelector('select, [role="combobox"], [role="listbox"]'),
+                    rawText: fullText.slice(0, 300),
                 });
             }
+
+            return JSON.stringify(results);
         })()
     """)
-    log.info(f"🧪 [scan_slicers] evaluate mínimo bruto: {minimal_raw}")
-
-    payload_raw = await tab.evaluate("""
-        (() => {
-            try {
-                const results = [];
-                const resolveReportDocument = () => {
-                    const mainCount = document.querySelectorAll('visual-container').length;
-                    if (mainCount > 0) return { doc: document, source: 'document' };
-                    const iframes = Array.from(document.querySelectorAll('iframe'));
-                    for (let i = 0; i < iframes.length; i++) {
-                        try {
-                            const d = iframes[i].contentDocument;
-                            if (!d) continue;
-                            if (d.querySelectorAll('visual-container').length > 0) {
-                                return { doc: d, source: `iframe[${i}]` };
-                            }
-                        } catch (e) {}
-                    }
-                    return { doc: document, source: 'document' };
-                };
-                const reportCtx = resolveReportDocument();
-                const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
-                const norm = txt => (txt || '').replace(/\\s+/g, ' ').trim();
-                const diagnostics = {
-                    contextSource: reportCtx.source,
-                    rawVisualContainers: containers.length,
-                    rawSlicerCandidates: 0,
-                    discardedBySize: 0
-                };
-
-                containers.forEach((vc, index) => {
-                    const el = vc.querySelector('transform') || vc;
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width < 15 || rect.height < 15) {
-                        diagnostics.discardedBySize += 1;
-                        return;
-                    }
-
-                    const allClasses = [
-                        vc.className || '',
-                        el.className || '',
-                        ...Array.from(vc.querySelectorAll('[class]')).slice(0, 40).map(e => String(e.className || ''))
-                    ].join(' ').toLowerCase();
-
-                    const isSlicer = (
-                        allClasses.includes('slicer') ||
-                        allClasses.includes('chiclet') ||
-                        !!vc.querySelector('.slicer-container, .slicer-content-wrapper, .slicer-body, .slicerBody, [class*="Slicer"], [class*="slicer"], .chiclet-slicer')
-                    );
-                    if (!isSlicer) return;
-                    diagnostics.rawSlicerCandidates += 1;
-
-                    let title = '';
-                    const headerEl = vc.querySelector(
-                        '.slicer-header-text, [class*="header-text"], h3, h4, .visual-title, .visualTitle, [class*="title"]'
-                    );
-                    if (headerEl) title = norm(headerEl.textContent);
-                    if (!title) {
-                        const ariaLabel = vc.getAttribute('aria-label') || el.getAttribute('aria-label') || '';
-                        title = norm(ariaLabel.replace(/\\(.*?\\)/g, ''));
-                    }
-
-                    let slicerType = 'lista';
-                    if (allClasses.includes('chiclet')) slicerType = 'chiclet';
-                    else if (vc.querySelector('input[type="range"], .slider, [class*="range"], [class*="Range"]')) slicerType = 'range';
-                    else if (vc.querySelector('select, .dropdown, [class*="dropdown"], [class*="Dropdown"]')) slicerType = 'dropdown';
-                    else if (vc.querySelector('.date-slicer, [class*="date-slicer"], [class*="DateSlicer"]')) slicerType = 'date';
-                    else if (vc.querySelector('input[type="text"], input.searchInput')) slicerType = 'busca';
-
-                    const allValues = [];
-                    const selectedValues = [];
-                    const seen = new Set();
-                    const selectedSet = new Set();
-
-                    const items = vc.querySelectorAll(
-                        '.slicerItemContainer, [class*="slicerItem"], [role="option"], [role="listitem"], .row, [class*="chiclet"]'
-                    );
-                    items.forEach(item => {
-                        const value = norm(
-                            item.querySelector('.slicerText, span, [class*="slicerText"], [class*="text"], label')?.textContent || item.textContent
-                        );
-                        if (!value || value.length > 80) return;
-                        const lower = value.toLowerCase();
-                        if (lower === 'selecionar tudo' || lower === 'select all') return;
-                        if (!seen.has(value)) {
-                            seen.add(value);
-                            allValues.push(value);
-                        }
-
-                        const checkbox = item.querySelector('.slicerCheckbox, input[type="checkbox"], [class*="checkbox"], [class*="Checkbox"]');
-                        const isSelected = (
-                            item.classList.contains('selected') ||
-                            item.classList.contains('isSelected') ||
-                            item.querySelector('.selected, .isSelected, .partiallySelected') !== null ||
-                            item.getAttribute('aria-selected') === 'true' ||
-                            item.getAttribute('aria-checked') === 'true' ||
-                            (checkbox && (
-                                checkbox.checked === true ||
-                                checkbox.getAttribute('aria-checked') === 'true' ||
-                                checkbox.classList.contains('selected') ||
-                                checkbox.classList.contains('partiallySelected')
-                            ))
-                        );
-                        if (isSelected && !selectedSet.has(value)) {
-                            selectedSet.add(value);
-                            selectedValues.push(value);
-                        }
-                    });
-
-                    const visibleStateCandidates = [
-                        vc.querySelector('input[type="text"]')?.value,
-                        vc.querySelector('input[aria-autocomplete]')?.value,
-                        vc.querySelector('.slicer-dropdown-menu, .dropdown-value, [class*="selectedValue"], [class*="currentValue"]')?.textContent,
-                        vc.querySelector('[aria-selected="true"]')?.textContent,
-                        vc.querySelector('[aria-checked="true"]')?.textContent
-                    ].map(norm).filter(Boolean);
-
-                    for (const val of visibleStateCandidates) {
-                        if (!selectedSet.has(val) && val.length <= 80) {
-                            selectedSet.add(val);
-                            selectedValues.push(val);
-                        }
-                    }
-
-                    const visibleText = norm(vc.textContent).toLowerCase();
-                    const pendingSignals = ['ainda não aplicado', 'not yet applied', 'apply changes', 'aplicar alterações'];
-                    const selectedSignals = ['múltiplos selecionados', 'multiple selections', 'selecionado', 'selected'];
-                    const hasPending = pendingSignals.some(t => visibleText.includes(t));
-                    const inferredFiltered = (
-                        selectedValues.length > 0 ||
-                        selectedSignals.some(t => visibleText.includes(t)) ||
-                        vc.querySelector('[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, .partiallySelected') !== null
-                    );
-
-                    results.push({
-                        index: index,
-                        title: title || `Slicer #${index + 1}`,
-                        type: slicerType,
-                        values: selectedValues.length ? selectedValues.slice(0, 10) : allValues.slice(0, 10),
-                        allValues: allValues.slice(0, 50),
-                        selectedValues: selectedValues.slice(0, 50),
-                        totalValues: allValues.length,
-                        totalSelected: selectedValues.length,
-                        hasPending: hasPending,
-                        applied: inferredFiltered && !hasPending,
-                        x: Math.round(rect.x),
-                        y: Math.round(rect.y),
-                        width: Math.round(rect.width),
-                        height: Math.round(rect.height),
-                    });
-                });
-
-                return JSON.stringify({ ok: true, payload: { slicers: results, diagnostics } });
-            } catch (err) {
-                return JSON.stringify({
-                    ok: false,
-                    error: String(err && err.message ? err.message : err),
-                    stack: String(err && err.stack ? err.stack : ''),
-                    phase: 'scan_slicers_complex_evaluate'
-                });
-            }
-        })()
-    """)
-    log.info(f"🧪 [scan_slicers] evaluate complexo bruto: {str(payload_raw)[:500]}")
 
     try:
-        payload_wrapper = json.loads(str(payload_raw)) if payload_raw else {}
-    except Exception as exc:
-        log.error(f"❌ [scan_slicers] Falha ao parsear retorno bruto do evaluate: {exc}")
-        log.error(f"❌ [scan_slicers] retorno bruto: {payload_raw}")
+        slicers = json.loads(str(slicers_raw))
+    except (json.JSONDecodeError, TypeError):
+        log.error(f"❌ Erro ao parsear slicers: {slicers_raw}")
+        await cleanup_residual_ui(tab, stage_label="scan de slicers - erro de parse", aggressive=True)
         return []
 
-    if not payload_wrapper.get("ok"):
-        log.error(
-            f"❌ [scan_slicers] erro JS no evaluate ({payload_wrapper.get('phase','?')}): "
-            f"{payload_wrapper.get('error','erro desconhecido')}"
-        )
-        if payload_wrapper.get("stack"):
-            log.error(f"❌ [scan_slicers] stack JS: {payload_wrapper.get('stack')}")
-        return []
-
-    payload = payload_wrapper.get("payload") or {}
-    slicers = list(payload.get("slicers") or [])
-    diagnostics = payload.get("diagnostics") or {}
-
-    log.info(
-        f"🧪 [diagnóstico] visual-container bruto no DOM: {int(diagnostics.get('rawVisualContainers', 0))} "
-        f"(contexto={diagnostics.get('contextSource', 'unknown')})"
-    )
-    log.info(f"🧪 [diagnóstico] candidatos brutos a slicer: {int(diagnostics.get('rawSlicerCandidates', 0))}")
-    log.info(f"🧪 [diagnóstico] descartados por tamanho (slicer scan): {int(diagnostics.get('discardedBySize', 0))}")
-
+    # ordena visualmente
     slicers.sort(key=lambda s: (s.get("y", 0), s.get("x", 0)))
 
+    # limpeza importante: não deixar nada aberto após o scan
     await cleanup_residual_ui(tab, stage_label="scan de slicers - final", aggressive=True)
+
     return slicers
 
 
@@ -2849,130 +2670,122 @@ async def navigate_to_report_page(tab, target_page: str) -> bool:
     target_norm = target_page.strip().lower()
     log.info(f"📄 Tentando navegar para página interna do relatório: '{target_page}'")
 
-    async def _get_page_signature():
-        context_info = await get_report_dom_context_info(tab, caller="navigate_signature")
-        try:
-            raw = await tab.evaluate("""
-                (() => {
-                    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-                    const norm = (s) => (s || '').toLowerCase();
-
-                    let selectedTab = '';
-                    const selectedCandidates = Array.from(document.querySelectorAll(
-                        '[role="tab"][aria-selected=\"true\"], li.section.active, li[class*=\"active\"]'
-                    ));
-                    for (const el of selectedCandidates) {
-                        const t = textOf(el);
-                        if (t && t.length <= 80) { selectedTab = t; break; }
-                    }
-
-                    const visualCount = document.querySelectorAll('visual-container').length;
-                    return JSON.stringify({ selectedTab, visualCount });
-                })()
-            """)
-            parsed = json.loads(str(raw)) if raw else {}
-            return {
-                "selected_tab": str(parsed.get("selectedTab") or "").strip(),
-                "visual_count": int(context_info.get("visual_count", 0)),
-                "context_source": str(context_info.get("context_source") or "unknown"),
-            }
-        except Exception:
-            return {"selected_tab": "", "visual_count": 0}
-
-    async def _legacy_click_page():
-        """
-        Restaura o miolo funcional de navegação usado na v05 (mais próximo disponível).
-        """
-        try:
-            result = await tab.evaluate(f"""
-                (() => {{
-                    const name = {json.dumps(target_page)}.toUpperCase();
-
-                    const navSelectors = [
-                        'li.section', 'li[class*="section"]',
-                        'ul.pane li', '[role="tab"]', '[role="listitem"]',
-                    ];
-                    for (const sel of navSelectors) {{
-                        for (const item of document.querySelectorAll(sel)) {{
-                            const text = item.textContent?.trim();
-                            if (text && text.toUpperCase().includes(name)) {{
-                                const target = item.querySelector('span, div, a') || item;
-                                target.scrollIntoView({{block: 'center'}});
-                                target.click();
-                                return `Aba: "${{text.substring(0, 50)}}"`;
-                            }}
-                        }}
-                    }}
-
-                    for (const el of document.querySelectorAll('span, a, button, label, h3, h4')) {{
-                        const text = el.textContent?.trim();
-                        if (text && text.toUpperCase().includes(name) && text.length < 40) {{
-                            const rect = el.getBoundingClientRect();
-                            if (rect.width > 5 && rect.height > 5) {{
-                                el.scrollIntoView({{block: 'center'}});
-                                el.click();
-                                return `Texto: "${{text.substring(0, 40)}}"`;
-                            }}
-                        }}
-                    }}
-
-                    const ariaEl = document.querySelector(`[aria-label*="${{name}}"]`)
-                                || document.querySelector(`[title*="${{name}}"]`);
-                    if (ariaEl) {{ ariaEl.click(); return "aria-label/title"; }}
-
-                    return null;
-                }})()
-            """)
-        except Exception:
-            result = None
-        clicked_detail = str(result or "").strip()
-        return bool(clicked_detail), clicked_detail
-
-    before = await _get_page_signature()
-    log.info(
-        f"  ℹ️ Estado antes da navegação: selectedTab='{before.get('selected_tab','')}', "
-        f"visuals={before.get('visual_count', 0)} (contexto={before.get('context_source','unknown')})"
-    )
-
+    # fecha overlays antes de procurar a aba
     await close_open_menus_and_overlays(tab, aggressive=True)
     await asyncio.sleep(1)
 
     for attempt in range(1, 6):
-        log.info(f"  🔎 Tentativa {attempt}/5 de navegar para '{target_page}' (estratégia legada v05)")
-        clicked, clicked_detail = await _legacy_click_page()
+        log.info(f"  🔎 Tentativa {attempt}/5 de localizar a aba '{target_page}'")
+        try:
+            result = await tab.evaluate(f"""
+                (() => {{
+                    const normalize = (s) =>
+                        (s || '')
+                        .trim()
+                        .toLowerCase()
+                        .replace(/\\s+/g, ' ');
 
-        if not clicked:
-            log.warning(f"  ⚠️ Tentativa {attempt}/5 sem clique válido na página '{target_page}'.")
-            await asyncio.sleep(1.5)
-            continue
+                    const target = {json.dumps(target_norm)};
 
-        log.info(f"  ✅ Clique realizado: {clicked_detail}")
-        log.info("  ⏳ Aguardando renderização pós-clique...")
-        await asyncio.sleep(LONG_WAIT)
+                    const selectors = [
+                        // Mais prováveis no Power BI (prioridade alta)
+                        '[role="tab"]',
+                        'button[role="tab"]',
+                        '[aria-selected]',
+                        'li.section',
+                        '[class*="tab"]',
+                        '[class*="page"]',
+                        // fallback
+                        'button',
+                        'a',
+                        'span',
+                        'div'
+                    ];
 
-        loaded = await wait_for_visual_containers(tab, retries=6, wait_seconds=3)
-        after = await _get_page_signature()
+                    const all = Array.from(document.querySelectorAll(selectors.join(',')));
 
-        selected_now = str(after.get("selected_tab", "")).lower()
-        selected_matches_target = bool(selected_now and target_norm in selected_now)
-        changed_signature = (
-            after.get("selected_tab") != before.get("selected_tab")
-            or after.get("visual_count") != before.get("visual_count")
-        )
+                    const visible = all.filter(el => {{
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) return false;
+                        const txt = normalize(el.innerText || el.textContent || '');
+                        // evita elementos gigantes que não são abas reais
+                        return txt.length > 0 && txt.length <= 80;
+                    }});
 
-        if loaded and (selected_matches_target or changed_signature):
+                    // prioriza elementos com cara de aba/página
+                    const scored = visible.map(el => {{
+                        const txt = normalize(el.innerText || el.textContent || '');
+                        const role = (el.getAttribute('role') || '').toLowerCase();
+                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        const title = (el.getAttribute('title') || '').toLowerCase();
+                        const data = (el.getAttribute('data-testid') || '').toLowerCase();
+                        const cls = (el.className || '').toString().toLowerCase();
+
+                        let score = 0;
+                        if (txt === target) score += 20;
+                        if (txt.includes(target)) score += 10;
+                        if (aria.includes(target)) score += 10;
+                        if (title.includes(target)) score += 8;
+                        if (role === 'tab') score += 12;
+                        if (cls.includes('tab')) score += 6;
+                        if (cls.includes('page')) score += 4;
+                        if (cls.includes('section')) score += 3;
+                        if (data.includes('tab') || data.includes('page')) score += 3;
+
+                        return {{ el, txt, score }};
+                    }})
+                    .filter(x => x.score >= 10)
+                    .sort((a, b) => b.score - a.score);
+
+                    if (!scored.length) {{
+                        return JSON.stringify({{ status: "NOT_FOUND" }});
+                    }}
+
+                    const best = scored[0].el;
+                    best.scrollIntoView({{ behavior: 'auto', block: 'center', inline: 'center' }});
+                    best.click();
+                    return JSON.stringify({{
+                        status: "CLICKED",
+                        clickedText: scored[0].txt || "",
+                        score: scored[0].score || 0
+                    }});
+                }})()
+            """)
+        except Exception:
+            result = None
+
+        parsed = None
+        if result:
+            try:
+                parsed = json.loads(str(result))
+            except Exception:
+                parsed = None
+
+        if parsed and parsed.get("status") == "CLICKED":
+            clicked_text = parsed.get("clickedText", "").strip()
+            score = parsed.get("score")
             log.info(
-                f"  ✅ Navegação confirmada para '{target_page}': "
-                f"selectedTab='{after.get('selected_tab','')}', visuals={after.get('visual_count', 0)} "
-                f"(contexto={after.get('context_source','unknown')})"
+                f"  ✅ Clique enviado na aba/página '{clicked_text or target_page}' "
+                f"(score={score})"
             )
-            return True
 
-        log.warning(
-            f"  ⚠️ Clique ocorreu, mas sem confirmação sólida da troca de página. "
-            f"selectedTab='{after.get('selected_tab','')}', visuals={after.get('visual_count', 0)}"
-        )
-        await asyncio.sleep(1.5)
+            log.info("  ⏳ Aguardando renderização da nova página...")
+            await asyncio.sleep(LONG_WAIT)
+
+            loaded = await wait_for_visual_containers(tab, retries=6, wait_seconds=3)
+            if loaded:
+                log.info(f"  ✅ Navegação para '{target_page}' confirmada com visuais renderizados.")
+                return True
+
+            log.warning(
+                f"  ⚠️ Clique na página '{target_page}' foi feito, mas sem confirmação de renderização."
+            )
+        elif parsed and parsed.get("status") == "NOT_FOUND":
+            log.info(f"  ⏳ Aba/página '{target_page}' não encontrada nesta tentativa.")
+        else:
+            log.warning(f"  ⚠️ Falha ao tentar localizar/clicar na página '{target_page}'.")
+
+        await asyncio.sleep(2)
 
     log.error(f"❌ Não foi possível navegar para a página '{target_page}'.")
     return False
@@ -2982,85 +2795,20 @@ async def wait_for_visual_containers(tab, retries: int = 10, wait_seconds: int =
     Aguarda os visual-containers aparecerem na página atual do relatório.
     """
     for attempt in range(1, retries + 1):
-        context_info = await get_report_dom_context_info(
-            tab,
-            caller=f"wait_for_visual_containers tentativa {attempt}/{retries}",
-        )
-        count = int(context_info.get("visual_count", 0))
-        context_source = str(context_info.get("context_source") or "unknown")
+        try:
+            count = await tab.evaluate("document.querySelectorAll('visual-container').length")
+            count = int(count or 0)
+        except Exception:
+            count = 0
 
         if count > 0:
-            log.info(f"✅ Visual-containers detectados: {count} (contexto={context_source})")
+            log.info(f"✅ Visual-containers detectados: {count}")
             return True
 
-        log.info(
-            f"⏳ Aguardando visuais renderizarem... tentativa {attempt}/{retries} "
-            f"(contexto={context_source}, count={count})"
-        )
+        log.info(f"⏳ Aguardando visuais renderizarem... tentativa {attempt}/{retries}")
         await asyncio.sleep(wait_seconds)
 
     return False
-
-
-async def get_report_dom_context_info(tab, caller: str = ""):
-    """
-    Resolve o contexto DOM do relatório (documento principal ou iframe com visual-container).
-    Essa função é usada de forma unificada por confirmação pós-navegação e scans.
-    """
-    try:
-        raw = await tab.evaluate("""
-            (() => {
-                const result = {
-                    contextSource: 'document',
-                    visualCount: 0,
-                    frameIndex: -1
-                };
-
-                try {
-                    const mainCount = document.querySelectorAll('visual-container').length;
-                    if (mainCount > 0) {
-                        result.contextSource = 'document';
-                        result.visualCount = mainCount;
-                        return JSON.stringify(result);
-                    }
-                } catch (e) {}
-
-                const iframes = Array.from(document.querySelectorAll('iframe'));
-                for (let i = 0; i < iframes.length; i++) {
-                    const fr = iframes[i];
-                    try {
-                        const d = fr.contentDocument;
-                        if (!d) continue;
-                        const c = d.querySelectorAll('visual-container').length;
-                        if (c > 0) {
-                            result.contextSource = `iframe[${i}]`;
-                            result.visualCount = c;
-                            result.frameIndex = i;
-                            return JSON.stringify(result);
-                        }
-                    } catch (e) {
-                        // cross-origin ou indisponível
-                    }
-                }
-
-                return JSON.stringify(result);
-            })()
-        """)
-        parsed = json.loads(str(raw)) if raw else {}
-        info = {
-            "context_source": str(parsed.get("contextSource") or "document"),
-            "visual_count": int(parsed.get("visualCount") or 0),
-            "frame_index": int(parsed.get("frameIndex") or -1),
-        }
-    except Exception:
-        info = {"context_source": "unavailable", "visual_count": 0, "frame_index": -1}
-
-    if caller:
-        log.info(
-            f"🧪 [dom-context] {caller}: source={info['context_source']}, "
-            f"visuals={info['visual_count']}, frame={info['frame_index']}"
-        )
-    return info
 
 
 async def wait_for_visuals_or_abort(
