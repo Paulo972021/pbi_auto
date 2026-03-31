@@ -639,23 +639,18 @@ async def cleanup_residual_ui(tab, stage_label: str, aggressive: bool = False):
         log.info("  ✅ Limpeza aplicada (contagem de overlays indisponível)")
 
 
-async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6) -> bool:
+async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6, preserve_export_dialog: bool = False) -> bool:
     """
-    Fecha o popup de 'Você está copiando dados confidenciais' ou semelhantes,
-    sem clicar no link do Microsoft Learn.
-
-    Estratégia:
-    - procura dialog/modal visível
-    - tenta clicar em Fechar/X/Cancelar
-    - se houver botão tipo 'Copiar/Copy', ele NÃO deve ficar acionando em loop
-    - jamais clicar em links 'Saiba mais...' / Learn
+    Fecha popup de confidencialidade sem fechar o diálogo de exportação quando preserve_export_dialog=True.
     """
     handled_any = False
+    preserve_flag = "true" if preserve_export_dialog else "false"
 
     for _ in range(max_rounds):
         try:
-            result = await tab.evaluate("""
-                (() => {
+            result = await tab.evaluate(f"""
+                (() => {{
+                    const PRESERVE_EXPORT_DIALOG = {preserve_flag};
                     const textOf = (el) => (el?.innerText || el?.textContent || '').trim();
                     const lower = (s) => (s || '').toLowerCase();
 
@@ -667,14 +662,14 @@ async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6) -> bool:
                         '.dialog',
                     ].join(',')));
 
-                    const visibleDialogs = dialogs.filter(d => {
+                    const visibleDialogs = dialogs.filter(d => {{
                         const r = d.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
-                    });
+                    }});
 
                     const allCandidates = [];
 
-                    for (const dlg of visibleDialogs) {
+                    for (const dlg of visibleDialogs) {{
                         const dlgText = lower(textOf(dlg));
                         const isSensitive =
                             dlgText.includes('confidencial') ||
@@ -683,71 +678,51 @@ async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6) -> bool:
                             dlgText.includes('copying data') ||
                             dlgText.includes('exportar dados') ||
                             dlgText.includes('exporting data');
-
                         if (!isSensitive) continue;
 
-                        // Não inclui <a> para impedir clique em "Saiba mais"/Learn.
+                        const looksLikeExportDialog =
+                            dlgText.includes('.xlsx') ||
+                            dlgText.includes('dados resumidos') ||
+                            dlgText.includes('dados subjacentes') ||
+                            dlgText.includes('data with current layout');
+                        if (looksLikeExportDialog && PRESERVE_EXPORT_DIALOG) continue;
+
                         const els = dlg.querySelectorAll('button, [role="button"], [aria-label], [title]');
-                        for (const el of els) {
+                        for (const el of els) {{
                             const txt = lower(textOf(el));
                             const aria = lower(el.getAttribute('aria-label') || '');
                             const title = lower(el.getAttribute('title') || '');
                             const rect = el.getBoundingClientRect();
-                            const visible = rect.width > 0 && rect.height > 0;
-                            if (!visible) continue;
+                            if (!(rect.width > 0 && rect.height > 0)) continue;
 
                             const isLearn =
                                 txt.includes('saiba mais sobre como exportar dados') ||
                                 txt.includes('learn more about exporting data') ||
                                 txt.includes('saiba mais') ||
                                 txt.includes('learn more');
-
                             if (isLearn) continue;
 
-                            allCandidates.push({
-                                el,
-                                txt,
-                                aria,
-                                title
-                            });
-                        }
-                    }
+                            allCandidates.push({{ el, txt, aria, title }});
+                        }}
+                    }}
 
-                    // Prioridade 1: fechar/cancelar/x
-                    for (const item of allCandidates) {
-                        const { el, txt, aria, title } = item;
+                    for (const item of allCandidates) {{
+                        const {{ el, txt, aria, title }} = item;
                         const shouldClose =
-                            txt === 'x' ||
-                            aria === 'x' ||
-                            title === 'x' ||
-                            txt.includes('fechar') ||
-                            txt.includes('close') ||
-                            txt.includes('cancelar') ||
-                            txt.includes('cancel') ||
-                            aria.includes('fechar') ||
-                            aria.includes('close') ||
-                            aria.includes('cancelar') ||
-                            aria.includes('cancel') ||
-                            title.includes('fechar') ||
-                            title.includes('close');
-
-                        if (shouldClose) {
-                            try { el.click(); } catch (e) {}
+                            txt === 'x' || aria === 'x' || title === 'x' ||
+                            txt.includes('fechar') || txt.includes('close') ||
+                            txt.includes('cancelar') || txt.includes('cancel') ||
+                            aria.includes('fechar') || aria.includes('close') ||
+                            aria.includes('cancelar') || aria.includes('cancel') ||
+                            title.includes('fechar') || title.includes('close');
+                        if (shouldClose) {{
+                            try {{ el.click(); }} catch (e) {{}}
                             return "closed";
-                        }
-                    }
-
-                    // Prioridade 2: se não achou botão claro, tenta X genérico visível
-                    for (const item of allCandidates) {
-                        const { el, txt, aria, title } = item;
-                        if (txt === '×' || txt === 'x' || aria === 'x' || title === 'x') {
-                            try { el.click(); } catch (e) {}
-                            return "closed-x";
-                        }
-                    }
+                        }}
+                    }}
 
                     return "";
-                })()
+                }})()
             """)
         except Exception:
             result = ""
@@ -759,7 +734,6 @@ async def dismiss_sensitive_data_popup(tab, max_rounds: int = 6) -> bool:
             await press_escape(tab, times=1, wait_each=0.3)
             continue
 
-        # Se não achou nada explícito, tenta limpeza genérica
         await close_open_menus_and_overlays(tab, aggressive=True)
         await asyncio.sleep(0.8)
         break
@@ -1765,6 +1739,17 @@ async def scan_visuals(tab):
     payload = payload_wrapper.get("payload") or {}
     visuals = list(payload.get("visuals") or [])
     diagnostics = payload.get("diagnostics") or {}
+    log.info(f"🧪 [scan_visuals] total no payload bruto: {len(payload.get('visuals') or [])}")
+    log.info(f"🧪 [scan_visuals] total após parse JSON: {len(visuals)}")
+
+    # deduplicação explícita por index para evitar colapsos silenciosos
+    dedup_map = {}
+    for v in visuals:
+        idx = v.get("index")
+        if idx not in dedup_map:
+            dedup_map[idx] = v
+    visuals = list(dedup_map.values())
+    log.info(f"🧪 [scan_visuals] total após deduplicação (index): {len(visuals)}")
 
     raw_count = int(diagnostics.get("rawCount", 0))
     kept_count = int(diagnostics.get("keptCount", len(visuals)))
@@ -1781,11 +1766,9 @@ async def scan_visuals(tab):
     if raw_count > 0 and kept_count == 0:
         log.warning("⚠️ Diagnóstico: havia visual-container bruto, mas todos foram descartados pelos filtros.")
 
-    # comportamento v5: prioriza visuais com header/botão; se zerar, usa todos os mantidos
-    exportable = [v for v in visuals if v.get("hasHeader") or v.get("hasOptionsButton")]
-    if not exportable and visuals:
-        log.warning("⚠️ Nenhum visual com header/botão detectado; usando lista completa (fallback v5).")
-        exportable = visuals
+    # Evita colapso para 1 item: mantém todos os visuais lidos no payload.
+    exportable = list(visuals)
+    log.info(f"🧪 [scan_visuals] total após filtro final de exibição/exportação: {len(exportable)}")
 
     exportable.sort(key=lambda v: (0 if v.get('hasOptionsButton') else 1, v.get('y', 0), v.get('x', 0)))
 
@@ -2015,6 +1998,28 @@ async def wait_export_dialog(tab, retries: int = 8) -> bool:
     return False
 
 
+async def get_visible_dialog_snapshot(tab) -> list[str]:
+    """Diagnóstico: lista textos resumidos dos dialogs visíveis."""
+    try:
+        raw = await tab.evaluate("""
+            (() => {
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                const dialogs = Array.from(document.querySelectorAll(
+                    '[role="dialog"], [aria-modal="true"], .modal, .popup, .dialog'
+                )).filter(isVisible);
+                const items = dialogs.map(d => (d.innerText || d.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 140));
+                return JSON.stringify(items);
+            })()
+        """)
+        parsed = json.loads(str(raw)) if raw else []
+        return [str(x) for x in parsed]
+    except Exception:
+        return []
+
+
 async def select_export_type(tab) -> bool:
     """
     Seleciona a opção de exportação.
@@ -2211,26 +2216,30 @@ async def export_single_visual(tab, visual) -> bool:
 
     log.info("  ✅ Menu acionado: Exportar dados")
     await asyncio.sleep(MEDIUM_WAIT)
-
-    # trata popup confidencial, se aparecer
-    await dismiss_sensitive_data_popup(tab)
     tab = await ensure_report_tab_still_valid(tab, POWERBI_URL)
+    dialogs_after_export_click = await get_visible_dialog_snapshot(tab)
+    if dialogs_after_export_click:
+        log.info(f"  🧪 Diálogos visíveis após 'Exportar dados': {dialogs_after_export_click[:3]}")
 
     confirmed = False
     for dialog_attempt in range(1, 3):
         dialog_ready = await wait_export_dialog(tab, retries=6 if dialog_attempt == 1 else 4)
         if not dialog_ready:
-            await dismiss_sensitive_data_popup(tab)
+            await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
             log.info(f"  ⚠️ Tentativa {dialog_attempt}/2 sem diálogo de exportação pronto.")
+            snapshot = await get_visible_dialog_snapshot(tab)
+            if snapshot:
+                log.info(f"  🧪 Diálogo(s) ainda visíveis na tentativa {dialog_attempt}: {snapshot[:3]}")
             continue
 
-        await dismiss_sensitive_data_popup(tab)
+        # Se diálogo de exportação está pronto, não fechá-lo por engano.
+        await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
         await select_export_type(tab)
-        await dismiss_sensitive_data_popup(tab)
+        await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
 
         confirmed = await confirm_export_dialog(tab)
         if not confirmed:
-            await dismiss_sensitive_data_popup(tab)
+            await dismiss_sensitive_data_popup(tab, preserve_export_dialog=True)
             confirmed = await confirm_export_dialog(tab)
 
         if confirmed:
