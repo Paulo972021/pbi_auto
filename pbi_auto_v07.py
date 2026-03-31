@@ -1,4 +1,4 @@
-#pbi_auto_v06.py
+#pbi_auto_v07.py
 """
 Automação Power BI - Scan + Exportação Seletiva de Visuais
 Usa nodriver para:
@@ -11,7 +11,7 @@ Uso:
     1. Cole seu link do Power BI na variável POWERBI_URL
     2. Cole o caminho do navegador na variável BROWSER_PATH
     3. (Opcional) Altere TARGET_PAGE se quiser outra aba
-    4. Execute: python powerbi_export.py
+    4. Execute: python pbi_auto_v07.py
 """
 
 import asyncio
@@ -2670,127 +2670,122 @@ async def navigate_to_report_page(tab, target_page: str) -> bool:
     target_norm = target_page.strip().lower()
     log.info(f"📄 Tentando navegar para página interna do relatório: '{target_page}'")
 
-    async def _get_page_signature():
-        try:
-            raw = await tab.evaluate("""
-                (() => {
-                    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-                    const norm = (s) => (s || '').toLowerCase();
-
-                    let selectedTab = '';
-                    const selectedCandidates = Array.from(document.querySelectorAll(
-                        '[role="tab"][aria-selected=\"true\"], li.section.active, li[class*=\"active\"]'
-                    ));
-                    for (const el of selectedCandidates) {
-                        const t = textOf(el);
-                        if (t && t.length <= 80) { selectedTab = t; break; }
-                    }
-
-                    const visualCount = document.querySelectorAll('visual-container').length;
-                    return JSON.stringify({ selectedTab, visualCount });
-                })()
-            """)
-            parsed = json.loads(str(raw)) if raw else {}
-            return {
-                "selected_tab": str(parsed.get("selectedTab") or "").strip(),
-                "visual_count": int(parsed.get("visualCount") or 0),
-            }
-        except Exception:
-            return {"selected_tab": "", "visual_count": 0}
-
-    async def _legacy_click_page():
-        """
-        Restaura o miolo funcional de navegação usado na v05 (mais próximo disponível).
-        """
-        try:
-            result = await tab.evaluate(f"""
-                (() => {{
-                    const name = {json.dumps(target_page)}.toUpperCase();
-
-                    const navSelectors = [
-                        'li.section', 'li[class*="section"]',
-                        'ul.pane li', '[role="tab"]', '[role="listitem"]',
-                    ];
-                    for (const sel of navSelectors) {{
-                        for (const item of document.querySelectorAll(sel)) {{
-                            const text = item.textContent?.trim();
-                            if (text && text.toUpperCase().includes(name)) {{
-                                const target = item.querySelector('span, div, a') || item;
-                                target.scrollIntoView({{block: 'center'}});
-                                target.click();
-                                return `Aba: "${{text.substring(0, 50)}}"`;
-                            }}
-                        }}
-                    }}
-
-                    for (const el of document.querySelectorAll('span, a, button, label, h3, h4')) {{
-                        const text = el.textContent?.trim();
-                        if (text && text.toUpperCase().includes(name) && text.length < 40) {{
-                            const rect = el.getBoundingClientRect();
-                            if (rect.width > 5 && rect.height > 5) {{
-                                el.scrollIntoView({{block: 'center'}});
-                                el.click();
-                                return `Texto: "${{text.substring(0, 40)}}"`;
-                            }}
-                        }}
-                    }}
-
-                    const ariaEl = document.querySelector(`[aria-label*="${{name}}"]`)
-                                || document.querySelector(`[title*="${{name}}"]`);
-                    if (ariaEl) {{ ariaEl.click(); return "aria-label/title"; }}
-
-                    return null;
-                }})()
-            """)
-        except Exception:
-            result = None
-        clicked_detail = str(result or "").strip()
-        return bool(clicked_detail), clicked_detail
-
-    before = await _get_page_signature()
-    log.info(
-        f"  ℹ️ Estado antes da navegação: selectedTab='{before.get('selected_tab','')}', "
-        f"visuals={before.get('visual_count', 0)}"
-    )
-
+    # fecha overlays antes de procurar a aba
     await close_open_menus_and_overlays(tab, aggressive=True)
     await asyncio.sleep(1)
 
     for attempt in range(1, 6):
-        log.info(f"  🔎 Tentativa {attempt}/5 de navegar para '{target_page}' (estratégia legada v05)")
-        clicked, clicked_detail = await _legacy_click_page()
+        log.info(f"  🔎 Tentativa {attempt}/5 de localizar a aba '{target_page}'")
+        try:
+            result = await tab.evaluate(f"""
+                (() => {{
+                    const normalize = (s) =>
+                        (s || '')
+                        .trim()
+                        .toLowerCase()
+                        .replace(/\\s+/g, ' ');
 
-        if not clicked:
-            log.warning(f"  ⚠️ Tentativa {attempt}/5 sem clique válido na página '{target_page}'.")
-            await asyncio.sleep(1.5)
-            continue
+                    const target = {json.dumps(target_norm)};
 
-        log.info(f"  ✅ Clique realizado: {clicked_detail}")
-        log.info("  ⏳ Aguardando renderização pós-clique...")
-        await asyncio.sleep(LONG_WAIT)
+                    const selectors = [
+                        // Mais prováveis no Power BI (prioridade alta)
+                        '[role="tab"]',
+                        'button[role="tab"]',
+                        '[aria-selected]',
+                        'li.section',
+                        '[class*="tab"]',
+                        '[class*="page"]',
+                        // fallback
+                        'button',
+                        'a',
+                        'span',
+                        'div'
+                    ];
 
-        loaded = await wait_for_visual_containers(tab, retries=6, wait_seconds=3)
-        after = await _get_page_signature()
+                    const all = Array.from(document.querySelectorAll(selectors.join(',')));
 
-        selected_now = str(after.get("selected_tab", "")).lower()
-        selected_matches_target = bool(selected_now and target_norm in selected_now)
-        changed_signature = (
-            after.get("selected_tab") != before.get("selected_tab")
-            or after.get("visual_count") != before.get("visual_count")
-        )
+                    const visible = all.filter(el => {{
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) return false;
+                        const txt = normalize(el.innerText || el.textContent || '');
+                        // evita elementos gigantes que não são abas reais
+                        return txt.length > 0 && txt.length <= 80;
+                    }});
 
-        if loaded and (selected_matches_target or changed_signature):
+                    // prioriza elementos com cara de aba/página
+                    const scored = visible.map(el => {{
+                        const txt = normalize(el.innerText || el.textContent || '');
+                        const role = (el.getAttribute('role') || '').toLowerCase();
+                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        const title = (el.getAttribute('title') || '').toLowerCase();
+                        const data = (el.getAttribute('data-testid') || '').toLowerCase();
+                        const cls = (el.className || '').toString().toLowerCase();
+
+                        let score = 0;
+                        if (txt === target) score += 20;
+                        if (txt.includes(target)) score += 10;
+                        if (aria.includes(target)) score += 10;
+                        if (title.includes(target)) score += 8;
+                        if (role === 'tab') score += 12;
+                        if (cls.includes('tab')) score += 6;
+                        if (cls.includes('page')) score += 4;
+                        if (cls.includes('section')) score += 3;
+                        if (data.includes('tab') || data.includes('page')) score += 3;
+
+                        return {{ el, txt, score }};
+                    }})
+                    .filter(x => x.score >= 10)
+                    .sort((a, b) => b.score - a.score);
+
+                    if (!scored.length) {{
+                        return JSON.stringify({{ status: "NOT_FOUND" }});
+                    }}
+
+                    const best = scored[0].el;
+                    best.scrollIntoView({{ behavior: 'auto', block: 'center', inline: 'center' }});
+                    best.click();
+                    return JSON.stringify({{
+                        status: "CLICKED",
+                        clickedText: scored[0].txt || "",
+                        score: scored[0].score || 0
+                    }});
+                }})()
+            """)
+        except Exception:
+            result = None
+
+        parsed = None
+        if result:
+            try:
+                parsed = json.loads(str(result))
+            except Exception:
+                parsed = None
+
+        if parsed and parsed.get("status") == "CLICKED":
+            clicked_text = parsed.get("clickedText", "").strip()
+            score = parsed.get("score")
             log.info(
-                f"  ✅ Navegação confirmada para '{target_page}': "
-                f"selectedTab='{after.get('selected_tab','')}', visuals={after.get('visual_count', 0)}"
+                f"  ✅ Clique enviado na aba/página '{clicked_text or target_page}' "
+                f"(score={score})"
             )
-            return True
 
-        log.warning(
-            f"  ⚠️ Clique ocorreu, mas sem confirmação sólida da troca de página. "
-            f"selectedTab='{after.get('selected_tab','')}', visuals={after.get('visual_count', 0)}"
-        )
-        await asyncio.sleep(1.5)
+            log.info("  ⏳ Aguardando renderização da nova página...")
+            await asyncio.sleep(LONG_WAIT)
+
+            loaded = await wait_for_visual_containers(tab, retries=6, wait_seconds=3)
+            if loaded:
+                log.info(f"  ✅ Navegação para '{target_page}' confirmada com visuais renderizados.")
+                return True
+
+            log.warning(
+                f"  ⚠️ Clique na página '{target_page}' foi feito, mas sem confirmação de renderização."
+            )
+        elif parsed and parsed.get("status") == "NOT_FOUND":
+            log.info(f"  ⏳ Aba/página '{target_page}' não encontrada nesta tentativa.")
+        else:
+            log.warning(f"  ⚠️ Falha ao tentar localizar/clicar na página '{target_page}'.")
+
+        await asyncio.sleep(2)
 
     log.error(f"❌ Não foi possível navegar para a página '{target_page}'.")
     return False
