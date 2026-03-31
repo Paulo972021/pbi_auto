@@ -1599,6 +1599,7 @@ async def scan_visuals(tab):
     - valida se o menu aberto realmente é do visual
     """
     log.info("🔎 Escaneando visuais na página (base v5)...")
+    await get_report_dom_context_info(tab, caller="scan_visuals (pré-scan)")
     await close_open_menus_and_overlays(tab, aggressive=True)
 
     payload = await eval_json(tab, """
@@ -1609,7 +1610,24 @@ async def scan_visuals(tab):
                 discardReasons[reason] = (discardReasons[reason] || 0) + 1;
             };
 
-            const containers = Array.from(document.querySelectorAll('visual-container'));
+            const resolveReportDocument = () => {
+                const mainCount = document.querySelectorAll('visual-container').length;
+                if (mainCount > 0) return { doc: document, source: 'document' };
+                const iframes = Array.from(document.querySelectorAll('iframe'));
+                for (let i = 0; i < iframes.length; i++) {
+                    try {
+                        const d = iframes[i].contentDocument;
+                        if (!d) continue;
+                        if (d.querySelectorAll('visual-container').length > 0) {
+                            return { doc: d, source: `iframe[${i}]` };
+                        }
+                    } catch (e) {}
+                }
+                return { doc: document, source: 'document' };
+            };
+
+            const reportCtx = resolveReportDocument();
+            const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
             const rawCount = containers.length;
 
             containers.forEach((vc, index) => {
@@ -1686,6 +1704,7 @@ async def scan_visuals(tab):
             return {
                 visuals: results,
                 diagnostics: {
+                    contextSource: reportCtx.source,
                     rawCount,
                     keptCount: results.length,
                     withHeaderOrBtn,
@@ -1703,8 +1722,9 @@ async def scan_visuals(tab):
     kept_count = int(diagnostics.get("keptCount", len(visuals)))
     discarded_count = int(diagnostics.get("discardedCount", max(0, raw_count - kept_count)))
     discard_reasons = diagnostics.get("discardReasons", {}) or {}
+    context_source = str(diagnostics.get("contextSource") or "unknown")
 
-    log.info(f"🧪 [diagnóstico] visual-container bruto no DOM: {raw_count}")
+    log.info(f"🧪 [diagnóstico] visual-container bruto no DOM: {raw_count} (contexto={context_source})")
     log.info(f"🧪 [diagnóstico] mantidos no scan: {kept_count} | descartados: {discarded_count}")
     if discard_reasons:
         for reason, qty in discard_reasons.items():
@@ -2347,14 +2367,32 @@ async def scan_slicers(tab):
     - não deixar dropdown, tooltip ou painel aberto após a leitura
     """
     log.info("🎚️ Escaneando filtros/slicers (base v5)...")
+    await get_report_dom_context_info(tab, caller="scan_slicers (pré-scan)")
     await cleanup_residual_ui(tab, stage_label="scan de slicers - início", aggressive=True)
 
     payload = await eval_json(tab, """
         (() => {
             const results = [];
-            const containers = Array.from(document.querySelectorAll('visual-container'));
+            const resolveReportDocument = () => {
+                const mainCount = document.querySelectorAll('visual-container').length;
+                if (mainCount > 0) return { doc: document, source: 'document' };
+                const iframes = Array.from(document.querySelectorAll('iframe'));
+                for (let i = 0; i < iframes.length; i++) {
+                    try {
+                        const d = iframes[i].contentDocument;
+                        if (!d) continue;
+                        if (d.querySelectorAll('visual-container').length > 0) {
+                            return { doc: d, source: `iframe[${i}]` };
+                        }
+                    } catch (e) {}
+                }
+                return { doc: document, source: 'document' };
+            };
+            const reportCtx = resolveReportDocument();
+            const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
             const norm = txt => (txt || '').replace(/\\s+/g, ' ').trim();
             const diagnostics = {
+                contextSource: reportCtx.source,
                 rawVisualContainers: containers.length,
                 rawSlicerCandidates: 0,
                 discardedBySize: 0
@@ -2489,7 +2527,10 @@ async def scan_slicers(tab):
     slicers = list((payload or {}).get("slicers") or [])
     diagnostics = (payload or {}).get("diagnostics") or {}
 
-    log.info(f"🧪 [diagnóstico] visual-container bruto no DOM: {int(diagnostics.get('rawVisualContainers', 0))}")
+    log.info(
+        f"🧪 [diagnóstico] visual-container bruto no DOM: {int(diagnostics.get('rawVisualContainers', 0))} "
+        f"(contexto={diagnostics.get('contextSource', 'unknown')})"
+    )
     log.info(f"🧪 [diagnóstico] candidatos brutos a slicer: {int(diagnostics.get('rawSlicerCandidates', 0))}")
     log.info(f"🧪 [diagnóstico] descartados por tamanho (slicer scan): {int(diagnostics.get('discardedBySize', 0))}")
 
@@ -2708,6 +2749,7 @@ async def navigate_to_report_page(tab, target_page: str) -> bool:
     log.info(f"📄 Tentando navegar para página interna do relatório: '{target_page}'")
 
     async def _get_page_signature():
+        context_info = await get_report_dom_context_info(tab, caller="navigate_signature")
         try:
             raw = await tab.evaluate("""
                 (() => {
@@ -2730,7 +2772,8 @@ async def navigate_to_report_page(tab, target_page: str) -> bool:
             parsed = json.loads(str(raw)) if raw else {}
             return {
                 "selected_tab": str(parsed.get("selectedTab") or "").strip(),
-                "visual_count": int(parsed.get("visualCount") or 0),
+                "visual_count": int(context_info.get("visual_count", 0)),
+                "context_source": str(context_info.get("context_source") or "unknown"),
             }
         except Exception:
             return {"selected_tab": "", "visual_count": 0}
@@ -2787,7 +2830,7 @@ async def navigate_to_report_page(tab, target_page: str) -> bool:
     before = await _get_page_signature()
     log.info(
         f"  ℹ️ Estado antes da navegação: selectedTab='{before.get('selected_tab','')}', "
-        f"visuals={before.get('visual_count', 0)}"
+        f"visuals={before.get('visual_count', 0)} (contexto={before.get('context_source','unknown')})"
     )
 
     await close_open_menus_and_overlays(tab, aggressive=True)
@@ -2819,7 +2862,8 @@ async def navigate_to_report_page(tab, target_page: str) -> bool:
         if loaded and (selected_matches_target or changed_signature):
             log.info(
                 f"  ✅ Navegação confirmada para '{target_page}': "
-                f"selectedTab='{after.get('selected_tab','')}', visuals={after.get('visual_count', 0)}"
+                f"selectedTab='{after.get('selected_tab','')}', visuals={after.get('visual_count', 0)} "
+                f"(contexto={after.get('context_source','unknown')})"
             )
             return True
 
@@ -2837,20 +2881,85 @@ async def wait_for_visual_containers(tab, retries: int = 10, wait_seconds: int =
     Aguarda os visual-containers aparecerem na página atual do relatório.
     """
     for attempt in range(1, retries + 1):
-        try:
-            count = await tab.evaluate("document.querySelectorAll('visual-container').length")
-            count = int(count or 0)
-        except Exception:
-            count = 0
+        context_info = await get_report_dom_context_info(
+            tab,
+            caller=f"wait_for_visual_containers tentativa {attempt}/{retries}",
+        )
+        count = int(context_info.get("visual_count", 0))
+        context_source = str(context_info.get("context_source") or "unknown")
 
         if count > 0:
-            log.info(f"✅ Visual-containers detectados: {count}")
+            log.info(f"✅ Visual-containers detectados: {count} (contexto={context_source})")
             return True
 
-        log.info(f"⏳ Aguardando visuais renderizarem... tentativa {attempt}/{retries}")
+        log.info(
+            f"⏳ Aguardando visuais renderizarem... tentativa {attempt}/{retries} "
+            f"(contexto={context_source}, count={count})"
+        )
         await asyncio.sleep(wait_seconds)
 
     return False
+
+
+async def get_report_dom_context_info(tab, caller: str = ""):
+    """
+    Resolve o contexto DOM do relatório (documento principal ou iframe com visual-container).
+    Essa função é usada de forma unificada por confirmação pós-navegação e scans.
+    """
+    try:
+        raw = await tab.evaluate("""
+            (() => {
+                const result = {
+                    contextSource: 'document',
+                    visualCount: 0,
+                    frameIndex: -1
+                };
+
+                try {
+                    const mainCount = document.querySelectorAll('visual-container').length;
+                    if (mainCount > 0) {
+                        result.contextSource = 'document';
+                        result.visualCount = mainCount;
+                        return JSON.stringify(result);
+                    }
+                } catch (e) {}
+
+                const iframes = Array.from(document.querySelectorAll('iframe'));
+                for (let i = 0; i < iframes.length; i++) {
+                    const fr = iframes[i];
+                    try {
+                        const d = fr.contentDocument;
+                        if (!d) continue;
+                        const c = d.querySelectorAll('visual-container').length;
+                        if (c > 0) {
+                            result.contextSource = `iframe[${i}]`;
+                            result.visualCount = c;
+                            result.frameIndex = i;
+                            return JSON.stringify(result);
+                        }
+                    } catch (e) {
+                        // cross-origin ou indisponível
+                    }
+                }
+
+                return JSON.stringify(result);
+            })()
+        """)
+        parsed = json.loads(str(raw)) if raw else {}
+        info = {
+            "context_source": str(parsed.get("contextSource") or "document"),
+            "visual_count": int(parsed.get("visualCount") or 0),
+            "frame_index": int(parsed.get("frameIndex") or -1),
+        }
+    except Exception:
+        info = {"context_source": "unavailable", "visual_count": 0, "frame_index": -1}
+
+    if caller:
+        log.info(
+            f"🧪 [dom-context] {caller}: source={info['context_source']}, "
+            f"visuals={info['visual_count']}, frame={info['frame_index']}"
+        )
+    return info
 
 
 async def wait_for_visuals_or_abort(
