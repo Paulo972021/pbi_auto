@@ -1602,121 +1602,169 @@ async def scan_visuals(tab):
     await get_report_dom_context_info(tab, caller="scan_visuals (pré-scan)")
     await close_open_menus_and_overlays(tab, aggressive=True)
 
-    payload = await eval_json(tab, """
+    # Diagnóstico mínimo obrigatório: provar que o evaluate simples enxerga os visual-containers
+    minimal_raw = await tab.evaluate("""
         (() => {
-            const results = [];
-            const discardReasons = {};
-            const incDiscard = (reason) => {
-                discardReasons[reason] = (discardReasons[reason] || 0) + 1;
-            };
-
-            const resolveReportDocument = () => {
-                const mainCount = document.querySelectorAll('visual-container').length;
-                if (mainCount > 0) return { doc: document, source: 'document' };
-                const iframes = Array.from(document.querySelectorAll('iframe'));
-                for (let i = 0; i < iframes.length; i++) {
-                    try {
-                        const d = iframes[i].contentDocument;
-                        if (!d) continue;
-                        if (d.querySelectorAll('visual-container').length > 0) {
-                            return { doc: d, source: `iframe[${i}]` };
-                        }
-                    } catch (e) {}
-                }
-                return { doc: document, source: 'document' };
-            };
-
-            const reportCtx = resolveReportDocument();
-            const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
-            const rawCount = containers.length;
-
-            containers.forEach((vc, index) => {
-                const el = vc.querySelector('transform') || vc;
-                if (!el) { incDiscard('no_host_element'); return; }
-
-                const rect = el.getBoundingClientRect();
-                if (rect.width < 15 || rect.height < 15) {
-                    incDiscard('tiny_rect(<15x15)');
-                    return;
-                }
-
-                let title = '';
-                let type = 'desconhecido';
-
-                const headerText = vc.querySelector(
-                    '.slicer-header-text, .visual-title, .visualTitle, [class*="title"], h2, h3, h4'
-                );
-                if (headerText) {
-                    title = headerText.textContent?.trim()?.substring(0, 80) || '';
-                }
-
-                const ariaLabel = el.getAttribute('aria-label') || vc.getAttribute('aria-label') || '';
-                if (!title && ariaLabel) {
-                    title = ariaLabel.substring(0, 80);
-                }
-
-                const allClasses = [
-                    vc.className || '',
-                    el.className || '',
-                    ...Array.from(vc.querySelectorAll('[class]')).slice(0, 30).map(e => String(e.className || ''))
-                ].join(' ').toLowerCase();
-
-                if (allClasses.includes('tablix') || allClasses.includes('table') || allClasses.includes('pivot')) type = 'Tabela';
-                else if (allClasses.includes('slicer')) type = 'Slicer';
-                else if (allClasses.includes('card')) type = 'Card';
-                else if (allClasses.includes('kpi')) type = 'KPI';
-                else if (allClasses.includes('map')) type = 'Mapa';
-                else if (allClasses.includes('chart') || allClasses.includes('bar') || allClasses.includes('line')) type = 'Gráfico';
-
-                if (!title) {
-                    const textContent = el.textContent?.replace(/\\s+/g, ' ').trim()?.substring(0, 100) || '';
-                    if (textContent.length > 5 && textContent.length < 80) title = textContent;
-                }
-
-                const optionsBtn = vc.querySelector(
-                    'button[class*="more-options"], button[class*="moreOptions"], ' +
-                    'visual-header-item-container button, visual-container-options-menu button, ' +
-                    'button[aria-label*="opções"], button[aria-label*="options"], ' +
-                    'button[aria-label*="Mais"], button[aria-label*="More"]'
-                );
-                const hasHeader = !!vc.querySelector(
-                    'visual-container-header, visual-container-options-menu, visual-header-item-container'
-                );
-
-                results.push({
-                    index: index,
-                    title: title || `Visual #${index + 1}`,
-                    type: type,
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
-                    x: Math.round(rect.left),
-                    y: Math.round(rect.top),
-                    hasOptionsButton: !!optionsBtn,
-                    hasHeader: hasHeader,
-                    menuOpened: false,
-                    hasExportData: false,
-                    exportReason: "nao_verificado",
-                    rawText: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 250)
+            try {
+                return JSON.stringify({
+                    ok: true,
+                    count: document.querySelectorAll('visual-container').length
                 });
-            });
-
-            const withHeaderOrBtn = results.filter(v => v.hasHeader || v.hasOptionsButton).length;
-            return {
-                visuals: results,
-                diagnostics: {
-                    contextSource: reportCtx.source,
-                    rawCount,
-                    keptCount: results.length,
-                    withHeaderOrBtn,
-                    discardedCount: rawCount - results.length,
-                    discardReasons
-                }
-            };
+            } catch (err) {
+                return JSON.stringify({
+                    ok: false,
+                    error: String(err && err.message ? err.message : err)
+                });
+            }
         })()
-    """, default={"visuals": [], "diagnostics": {}})
+    """)
+    log.info(f"🧪 [scan_visuals] evaluate mínimo bruto: {minimal_raw}")
 
-    visuals = list((payload or {}).get("visuals") or [])
-    diagnostics = (payload or {}).get("diagnostics") or {}
+    payload_raw = await tab.evaluate("""
+        (() => {
+            try {
+                const results = [];
+                const discardReasons = {};
+                const incDiscard = (reason) => {
+                    discardReasons[reason] = (discardReasons[reason] || 0) + 1;
+                };
+
+                const resolveReportDocument = () => {
+                    const mainCount = document.querySelectorAll('visual-container').length;
+                    if (mainCount > 0) return { doc: document, source: 'document' };
+                    const iframes = Array.from(document.querySelectorAll('iframe'));
+                    for (let i = 0; i < iframes.length; i++) {
+                        try {
+                            const d = iframes[i].contentDocument;
+                            if (!d) continue;
+                            if (d.querySelectorAll('visual-container').length > 0) {
+                                return { doc: d, source: `iframe[${i}]` };
+                            }
+                        } catch (e) {}
+                    }
+                    return { doc: document, source: 'document' };
+                };
+
+                const reportCtx = resolveReportDocument();
+                const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
+                const rawCount = containers.length;
+
+                containers.forEach((vc, index) => {
+                    const el = vc.querySelector('transform') || vc;
+                    if (!el) { incDiscard('no_host_element'); return; }
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 15 || rect.height < 15) {
+                        incDiscard('tiny_rect(<15x15)');
+                        return;
+                    }
+
+                    let title = '';
+                    let type = 'desconhecido';
+
+                    const headerText = vc.querySelector(
+                        '.slicer-header-text, .visual-title, .visualTitle, [class*="title"], h2, h3, h4'
+                    );
+                    if (headerText) {
+                        title = headerText.textContent?.trim()?.substring(0, 80) || '';
+                    }
+
+                    const ariaLabel = el.getAttribute('aria-label') || vc.getAttribute('aria-label') || '';
+                    if (!title && ariaLabel) {
+                        title = ariaLabel.substring(0, 80);
+                    }
+
+                    const allClasses = [
+                        vc.className || '',
+                        el.className || '',
+                        ...Array.from(vc.querySelectorAll('[class]')).slice(0, 30).map(e => String(e.className || ''))
+                    ].join(' ').toLowerCase();
+
+                    if (allClasses.includes('tablix') || allClasses.includes('table') || allClasses.includes('pivot')) type = 'Tabela';
+                    else if (allClasses.includes('slicer')) type = 'Slicer';
+                    else if (allClasses.includes('card')) type = 'Card';
+                    else if (allClasses.includes('kpi')) type = 'KPI';
+                    else if (allClasses.includes('map')) type = 'Mapa';
+                    else if (allClasses.includes('chart') || allClasses.includes('bar') || allClasses.includes('line')) type = 'Gráfico';
+
+                    if (!title) {
+                        const textContent = el.textContent?.replace(/\\s+/g, ' ').trim()?.substring(0, 100) || '';
+                        if (textContent.length > 5 && textContent.length < 80) title = textContent;
+                    }
+
+                    const optionsBtn = vc.querySelector(
+                        'button[class*="more-options"], button[class*="moreOptions"], ' +
+                        'visual-header-item-container button, visual-container-options-menu button, ' +
+                        'button[aria-label*="opções"], button[aria-label*="options"], ' +
+                        'button[aria-label*="Mais"], button[aria-label*="More"]'
+                    );
+                    const hasHeader = !!vc.querySelector(
+                        'visual-container-header, visual-container-options-menu, visual-header-item-container'
+                    );
+
+                    results.push({
+                        index: index,
+                        title: title || `Visual #${index + 1}`,
+                        type: type,
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        x: Math.round(rect.left),
+                        y: Math.round(rect.top),
+                        hasOptionsButton: !!optionsBtn,
+                        hasHeader: hasHeader,
+                        menuOpened: false,
+                        hasExportData: false,
+                        exportReason: "nao_verificado",
+                        rawText: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 250)
+                    });
+                });
+
+                const withHeaderOrBtn = results.filter(v => v.hasHeader || v.hasOptionsButton).length;
+                return JSON.stringify({
+                    ok: true,
+                    payload: {
+                        visuals: results,
+                        diagnostics: {
+                            contextSource: reportCtx.source,
+                            rawCount,
+                            keptCount: results.length,
+                            withHeaderOrBtn,
+                            discardedCount: rawCount - results.length,
+                            discardReasons
+                        }
+                    }
+                });
+            } catch (err) {
+                return JSON.stringify({
+                    ok: false,
+                    error: String(err && err.message ? err.message : err),
+                    stack: String(err && err.stack ? err.stack : ''),
+                    phase: 'scan_visuals_complex_evaluate'
+                });
+            }
+        })()
+    """)
+    log.info(f"🧪 [scan_visuals] evaluate complexo bruto: {str(payload_raw)[:500]}")
+
+    try:
+        payload_wrapper = json.loads(str(payload_raw)) if payload_raw else {}
+    except Exception as exc:
+        log.error(f"❌ [scan_visuals] Falha ao parsear retorno bruto do evaluate: {exc}")
+        log.error(f"❌ [scan_visuals] retorno bruto: {payload_raw}")
+        return []
+
+    if not payload_wrapper.get("ok"):
+        log.error(
+            f"❌ [scan_visuals] erro JS no evaluate ({payload_wrapper.get('phase','?')}): "
+            f"{payload_wrapper.get('error','erro desconhecido')}"
+        )
+        if payload_wrapper.get("stack"):
+            log.error(f"❌ [scan_visuals] stack JS: {payload_wrapper.get('stack')}")
+        return []
+
+    payload = payload_wrapper.get("payload") or {}
+    visuals = list(payload.get("visuals") or [])
+    diagnostics = payload.get("diagnostics") or {}
 
     raw_count = int(diagnostics.get("rawCount", 0))
     kept_count = int(diagnostics.get("keptCount", len(visuals)))
@@ -2370,162 +2418,206 @@ async def scan_slicers(tab):
     await get_report_dom_context_info(tab, caller="scan_slicers (pré-scan)")
     await cleanup_residual_ui(tab, stage_label="scan de slicers - início", aggressive=True)
 
-    payload = await eval_json(tab, """
+    minimal_raw = await tab.evaluate("""
         (() => {
-            const results = [];
-            const resolveReportDocument = () => {
-                const mainCount = document.querySelectorAll('visual-container').length;
-                if (mainCount > 0) return { doc: document, source: 'document' };
-                const iframes = Array.from(document.querySelectorAll('iframe'));
-                for (let i = 0; i < iframes.length; i++) {
-                    try {
-                        const d = iframes[i].contentDocument;
-                        if (!d) continue;
-                        if (d.querySelectorAll('visual-container').length > 0) {
-                            return { doc: d, source: `iframe[${i}]` };
-                        }
-                    } catch (e) {}
-                }
-                return { doc: document, source: 'document' };
-            };
-            const reportCtx = resolveReportDocument();
-            const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
-            const norm = txt => (txt || '').replace(/\\s+/g, ' ').trim();
-            const diagnostics = {
-                contextSource: reportCtx.source,
-                rawVisualContainers: containers.length,
-                rawSlicerCandidates: 0,
-                discardedBySize: 0
-            };
-
-            containers.forEach((vc, index) => {
-                const el = vc.querySelector('transform') || vc;
-                const rect = el.getBoundingClientRect();
-                if (rect.width < 15 || rect.height < 15) {
-                    diagnostics.discardedBySize += 1;
-                    return;
-                }
-
-                const allClasses = [
-                    vc.className || '',
-                    el.className || '',
-                    ...Array.from(vc.querySelectorAll('[class]')).slice(0, 40).map(e => String(e.className || ''))
-                ].join(' ').toLowerCase();
-
-                const isSlicer = (
-                    allClasses.includes('slicer') ||
-                    allClasses.includes('chiclet') ||
-                    !!vc.querySelector('.slicer-container, .slicer-content-wrapper, .slicer-body, .slicerBody, [class*="Slicer"], [class*="slicer"], .chiclet-slicer')
-                );
-                if (!isSlicer) return;
-                diagnostics.rawSlicerCandidates += 1;
-
-                let title = '';
-                const headerEl = vc.querySelector(
-                    '.slicer-header-text, [class*="header-text"], h3, h4, .visual-title, .visualTitle, [class*="title"]'
-                );
-                if (headerEl) title = norm(headerEl.textContent);
-                if (!title) {
-                    const ariaLabel = vc.getAttribute('aria-label') || el.getAttribute('aria-label') || '';
-                    title = norm(ariaLabel.replace(/\\(.*?\\)/g, ''));
-                }
-
-                let slicerType = 'lista';
-                if (allClasses.includes('chiclet')) slicerType = 'chiclet';
-                else if (vc.querySelector('input[type="range"], .slider, [class*="range"], [class*="Range"]')) slicerType = 'range';
-                else if (vc.querySelector('select, .dropdown, [class*="dropdown"], [class*="Dropdown"]')) slicerType = 'dropdown';
-                else if (vc.querySelector('.date-slicer, [class*="date-slicer"], [class*="DateSlicer"]')) slicerType = 'date';
-                else if (vc.querySelector('input[type="text"], input.searchInput')) slicerType = 'busca';
-
-                const allValues = [];
-                const selectedValues = [];
-                const seen = new Set();
-                const selectedSet = new Set();
-
-                const items = vc.querySelectorAll(
-                    '.slicerItemContainer, [class*="slicerItem"], [role="option"], [role="listitem"], .row, [class*="chiclet"]'
-                );
-                items.forEach(item => {
-                    const value = norm(
-                        item.querySelector('.slicerText, span, [class*="slicerText"], [class*="text"], label')?.textContent || item.textContent
-                    );
-                    if (!value || value.length > 80) return;
-                    const lower = value.toLowerCase();
-                    if (lower === 'selecionar tudo' || lower === 'select all') return;
-                    if (!seen.has(value)) {
-                        seen.add(value);
-                        allValues.push(value);
-                    }
-
-                    const checkbox = item.querySelector('.slicerCheckbox, input[type="checkbox"], [class*="checkbox"], [class*="Checkbox"]');
-                    const isSelected = (
-                        item.classList.contains('selected') ||
-                        item.classList.contains('isSelected') ||
-                        item.querySelector('.selected, .isSelected, .partiallySelected') !== null ||
-                        item.getAttribute('aria-selected') === 'true' ||
-                        item.getAttribute('aria-checked') === 'true' ||
-                        (checkbox && (
-                            checkbox.checked === true ||
-                            checkbox.getAttribute('aria-checked') === 'true' ||
-                            checkbox.classList.contains('selected') ||
-                            checkbox.classList.contains('partiallySelected')
-                        ))
-                    );
-                    if (isSelected && !selectedSet.has(value)) {
-                        selectedSet.add(value);
-                        selectedValues.push(value);
-                    }
+            try {
+                return JSON.stringify({
+                    ok: true,
+                    count: document.querySelectorAll('visual-container').length
                 });
-
-                const visibleStateCandidates = [
-                    vc.querySelector('input[type="text"]')?.value,
-                    vc.querySelector('input[aria-autocomplete]')?.value,
-                    vc.querySelector('.slicer-dropdown-menu, .dropdown-value, [class*="selectedValue"], [class*="currentValue"]')?.textContent,
-                    vc.querySelector('[aria-selected="true"]')?.textContent,
-                    vc.querySelector('[aria-checked="true"]')?.textContent
-                ].map(norm).filter(Boolean);
-
-                for (const val of visibleStateCandidates) {
-                    if (!selectedSet.has(val) && val.length <= 80) {
-                        selectedSet.add(val);
-                        selectedValues.push(val);
-                    }
-                }
-
-                const visibleText = norm(vc.textContent).toLowerCase();
-                const pendingSignals = ['ainda não aplicado', 'not yet applied', 'apply changes', 'aplicar alterações'];
-                const selectedSignals = ['múltiplos selecionados', 'multiple selections', 'selecionado', 'selected'];
-                const hasPending = pendingSignals.some(t => visibleText.includes(t));
-                const inferredFiltered = (
-                    selectedValues.length > 0 ||
-                    selectedSignals.some(t => visibleText.includes(t)) ||
-                    vc.querySelector('[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, .partiallySelected') !== null
-                );
-
-                results.push({
-                    index: index,
-                    title: title || `Slicer #${index + 1}`,
-                    type: slicerType,
-                    values: selectedValues.length ? selectedValues.slice(0, 10) : allValues.slice(0, 10),
-                    allValues: allValues.slice(0, 50),
-                    selectedValues: selectedValues.slice(0, 50),
-                    totalValues: allValues.length,
-                    totalSelected: selectedValues.length,
-                    hasPending: hasPending,
-                    applied: inferredFiltered && !hasPending,
-                    x: Math.round(rect.x),
-                    y: Math.round(rect.y),
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
+            } catch (err) {
+                return JSON.stringify({
+                    ok: false,
+                    error: String(err && err.message ? err.message : err)
                 });
-            });
-
-            return { slicers: results, diagnostics };
+            }
         })()
-    """, default={"slicers": [], "diagnostics": {}})
+    """)
+    log.info(f"🧪 [scan_slicers] evaluate mínimo bruto: {minimal_raw}")
 
-    slicers = list((payload or {}).get("slicers") or [])
-    diagnostics = (payload or {}).get("diagnostics") or {}
+    payload_raw = await tab.evaluate("""
+        (() => {
+            try {
+                const results = [];
+                const resolveReportDocument = () => {
+                    const mainCount = document.querySelectorAll('visual-container').length;
+                    if (mainCount > 0) return { doc: document, source: 'document' };
+                    const iframes = Array.from(document.querySelectorAll('iframe'));
+                    for (let i = 0; i < iframes.length; i++) {
+                        try {
+                            const d = iframes[i].contentDocument;
+                            if (!d) continue;
+                            if (d.querySelectorAll('visual-container').length > 0) {
+                                return { doc: d, source: `iframe[${i}]` };
+                            }
+                        } catch (e) {}
+                    }
+                    return { doc: document, source: 'document' };
+                };
+                const reportCtx = resolveReportDocument();
+                const containers = Array.from(reportCtx.doc.querySelectorAll('visual-container'));
+                const norm = txt => (txt || '').replace(/\\s+/g, ' ').trim();
+                const diagnostics = {
+                    contextSource: reportCtx.source,
+                    rawVisualContainers: containers.length,
+                    rawSlicerCandidates: 0,
+                    discardedBySize: 0
+                };
+
+                containers.forEach((vc, index) => {
+                    const el = vc.querySelector('transform') || vc;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 15 || rect.height < 15) {
+                        diagnostics.discardedBySize += 1;
+                        return;
+                    }
+
+                    const allClasses = [
+                        vc.className || '',
+                        el.className || '',
+                        ...Array.from(vc.querySelectorAll('[class]')).slice(0, 40).map(e => String(e.className || ''))
+                    ].join(' ').toLowerCase();
+
+                    const isSlicer = (
+                        allClasses.includes('slicer') ||
+                        allClasses.includes('chiclet') ||
+                        !!vc.querySelector('.slicer-container, .slicer-content-wrapper, .slicer-body, .slicerBody, [class*="Slicer"], [class*="slicer"], .chiclet-slicer')
+                    );
+                    if (!isSlicer) return;
+                    diagnostics.rawSlicerCandidates += 1;
+
+                    let title = '';
+                    const headerEl = vc.querySelector(
+                        '.slicer-header-text, [class*="header-text"], h3, h4, .visual-title, .visualTitle, [class*="title"]'
+                    );
+                    if (headerEl) title = norm(headerEl.textContent);
+                    if (!title) {
+                        const ariaLabel = vc.getAttribute('aria-label') || el.getAttribute('aria-label') || '';
+                        title = norm(ariaLabel.replace(/\\(.*?\\)/g, ''));
+                    }
+
+                    let slicerType = 'lista';
+                    if (allClasses.includes('chiclet')) slicerType = 'chiclet';
+                    else if (vc.querySelector('input[type="range"], .slider, [class*="range"], [class*="Range"]')) slicerType = 'range';
+                    else if (vc.querySelector('select, .dropdown, [class*="dropdown"], [class*="Dropdown"]')) slicerType = 'dropdown';
+                    else if (vc.querySelector('.date-slicer, [class*="date-slicer"], [class*="DateSlicer"]')) slicerType = 'date';
+                    else if (vc.querySelector('input[type="text"], input.searchInput')) slicerType = 'busca';
+
+                    const allValues = [];
+                    const selectedValues = [];
+                    const seen = new Set();
+                    const selectedSet = new Set();
+
+                    const items = vc.querySelectorAll(
+                        '.slicerItemContainer, [class*="slicerItem"], [role="option"], [role="listitem"], .row, [class*="chiclet"]'
+                    );
+                    items.forEach(item => {
+                        const value = norm(
+                            item.querySelector('.slicerText, span, [class*="slicerText"], [class*="text"], label')?.textContent || item.textContent
+                        );
+                        if (!value || value.length > 80) return;
+                        const lower = value.toLowerCase();
+                        if (lower === 'selecionar tudo' || lower === 'select all') return;
+                        if (!seen.has(value)) {
+                            seen.add(value);
+                            allValues.push(value);
+                        }
+
+                        const checkbox = item.querySelector('.slicerCheckbox, input[type="checkbox"], [class*="checkbox"], [class*="Checkbox"]');
+                        const isSelected = (
+                            item.classList.contains('selected') ||
+                            item.classList.contains('isSelected') ||
+                            item.querySelector('.selected, .isSelected, .partiallySelected') !== null ||
+                            item.getAttribute('aria-selected') === 'true' ||
+                            item.getAttribute('aria-checked') === 'true' ||
+                            (checkbox && (
+                                checkbox.checked === true ||
+                                checkbox.getAttribute('aria-checked') === 'true' ||
+                                checkbox.classList.contains('selected') ||
+                                checkbox.classList.contains('partiallySelected')
+                            ))
+                        );
+                        if (isSelected && !selectedSet.has(value)) {
+                            selectedSet.add(value);
+                            selectedValues.push(value);
+                        }
+                    });
+
+                    const visibleStateCandidates = [
+                        vc.querySelector('input[type="text"]')?.value,
+                        vc.querySelector('input[aria-autocomplete]')?.value,
+                        vc.querySelector('.slicer-dropdown-menu, .dropdown-value, [class*="selectedValue"], [class*="currentValue"]')?.textContent,
+                        vc.querySelector('[aria-selected="true"]')?.textContent,
+                        vc.querySelector('[aria-checked="true"]')?.textContent
+                    ].map(norm).filter(Boolean);
+
+                    for (const val of visibleStateCandidates) {
+                        if (!selectedSet.has(val) && val.length <= 80) {
+                            selectedSet.add(val);
+                            selectedValues.push(val);
+                        }
+                    }
+
+                    const visibleText = norm(vc.textContent).toLowerCase();
+                    const pendingSignals = ['ainda não aplicado', 'not yet applied', 'apply changes', 'aplicar alterações'];
+                    const selectedSignals = ['múltiplos selecionados', 'multiple selections', 'selecionado', 'selected'];
+                    const hasPending = pendingSignals.some(t => visibleText.includes(t));
+                    const inferredFiltered = (
+                        selectedValues.length > 0 ||
+                        selectedSignals.some(t => visibleText.includes(t)) ||
+                        vc.querySelector('[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, .partiallySelected') !== null
+                    );
+
+                    results.push({
+                        index: index,
+                        title: title || `Slicer #${index + 1}`,
+                        type: slicerType,
+                        values: selectedValues.length ? selectedValues.slice(0, 10) : allValues.slice(0, 10),
+                        allValues: allValues.slice(0, 50),
+                        selectedValues: selectedValues.slice(0, 50),
+                        totalValues: allValues.length,
+                        totalSelected: selectedValues.length,
+                        hasPending: hasPending,
+                        applied: inferredFiltered && !hasPending,
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                    });
+                });
+
+                return JSON.stringify({ ok: true, payload: { slicers: results, diagnostics } });
+            } catch (err) {
+                return JSON.stringify({
+                    ok: false,
+                    error: String(err && err.message ? err.message : err),
+                    stack: String(err && err.stack ? err.stack : ''),
+                    phase: 'scan_slicers_complex_evaluate'
+                });
+            }
+        })()
+    """)
+    log.info(f"🧪 [scan_slicers] evaluate complexo bruto: {str(payload_raw)[:500]}")
+
+    try:
+        payload_wrapper = json.loads(str(payload_raw)) if payload_raw else {}
+    except Exception as exc:
+        log.error(f"❌ [scan_slicers] Falha ao parsear retorno bruto do evaluate: {exc}")
+        log.error(f"❌ [scan_slicers] retorno bruto: {payload_raw}")
+        return []
+
+    if not payload_wrapper.get("ok"):
+        log.error(
+            f"❌ [scan_slicers] erro JS no evaluate ({payload_wrapper.get('phase','?')}): "
+            f"{payload_wrapper.get('error','erro desconhecido')}"
+        )
+        if payload_wrapper.get("stack"):
+            log.error(f"❌ [scan_slicers] stack JS: {payload_wrapper.get('stack')}")
+        return []
+
+    payload = payload_wrapper.get("payload") or {}
+    slicers = list(payload.get("slicers") or [])
+    diagnostics = payload.get("diagnostics") or {}
 
     log.info(
         f"🧪 [diagnóstico] visual-container bruto no DOM: {int(diagnostics.get('rawVisualContainers', 0))} "
