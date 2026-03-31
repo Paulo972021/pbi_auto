@@ -1598,95 +1598,134 @@ async def scan_visuals(tab):
     - tenta abrir 'Mais opções'
     - valida se o menu aberto realmente é do visual
     """
-    log.info("🔎 Escaneando visuais na página...")
+    log.info("🔎 Escaneando visuais na página (base v5)...")
     await close_open_menus_and_overlays(tab, aggressive=True)
 
-    raw = await tab.evaluate("""
+    payload = await eval_json(tab, """
         (() => {
-            const textOf = (el) => (el?.innerText || el?.textContent || '').trim();
-
-            const vcs = Array.from(document.querySelectorAll('visual-container'));
             const results = [];
+            const discardReasons = {};
+            const incDiscard = (reason) => {
+                discardReasons[reason] = (discardReasons[reason] || 0) + 1;
+            };
 
-            vcs.forEach((vc, index) => {
-                const r = vc.getBoundingClientRect();
+            const containers = Array.from(document.querySelectorAll('visual-container'));
+            const rawCount = containers.length;
 
-                if (r.width < 80 || r.height < 50) return;
+            containers.forEach((vc, index) => {
+                const el = vc.querySelector('transform') || vc;
+                if (!el) { incDiscard('no_host_element'); return; }
 
-                const text = textOf(vc);
-                const headerBtn =
-                    vc.querySelector('button[aria-label*="opções"]') ||
-                    vc.querySelector('button[aria-label*="options"]') ||
-                    vc.querySelector('.visual-header-item-container button') ||
-                    vc.querySelector('[class*="visualHeader"] button');
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 15 || rect.height < 15) {
+                    incDiscard('tiny_rect(<15x15)');
+                    return;
+                }
 
                 let title = '';
+                let type = 'desconhecido';
 
-                const titleCandidates = vc.querySelectorAll([
-                    '[title]',
-                    '.title',
-                    '.headerText',
-                    '.visual-title',
-                    'span',
-                    'div'
-                ].join(','));
-
-                for (const el of titleCandidates) {
-                    const t = textOf(el);
-                    if (!t) continue;
-                    if (t.length < 2) continue;
-
-                    const tl = t.toLowerCase();
-                    if (
-                        tl.includes('exportar dados') ||
-                        tl.includes('mostrar como uma tabela') ||
-                        tl.includes('saiba mais') ||
-                        tl.includes('learn more')
-                    ) {
-                        continue;
-                    }
-
-                    title = t;
-                    break;
+                const headerText = vc.querySelector(
+                    '.slicer-header-text, .visual-title, .visualTitle, [class*="title"], h2, h3, h4'
+                );
+                if (headerText) {
+                    title = headerText.textContent?.trim()?.substring(0, 80) || '';
                 }
+
+                const ariaLabel = el.getAttribute('aria-label') || vc.getAttribute('aria-label') || '';
+                if (!title && ariaLabel) {
+                    title = ariaLabel.substring(0, 80);
+                }
+
+                const allClasses = [
+                    vc.className || '',
+                    el.className || '',
+                    ...Array.from(vc.querySelectorAll('[class]')).slice(0, 30).map(e => String(e.className || ''))
+                ].join(' ').toLowerCase();
+
+                if (allClasses.includes('tablix') || allClasses.includes('table') || allClasses.includes('pivot')) type = 'Tabela';
+                else if (allClasses.includes('slicer')) type = 'Slicer';
+                else if (allClasses.includes('card')) type = 'Card';
+                else if (allClasses.includes('kpi')) type = 'KPI';
+                else if (allClasses.includes('map')) type = 'Mapa';
+                else if (allClasses.includes('chart') || allClasses.includes('bar') || allClasses.includes('line')) type = 'Gráfico';
 
                 if (!title) {
-                    title = `Visual #${index + 1}`;
+                    const textContent = el.textContent?.replace(/\\s+/g, ' ').trim()?.substring(0, 100) || '';
+                    if (textContent.length > 5 && textContent.length < 80) title = textContent;
                 }
 
+                const optionsBtn = vc.querySelector(
+                    'button[class*="more-options"], button[class*="moreOptions"], ' +
+                    'visual-header-item-container button, visual-container-options-menu button, ' +
+                    'button[aria-label*="opções"], button[aria-label*="options"], ' +
+                    'button[aria-label*="Mais"], button[aria-label*="More"]'
+                );
+                const hasHeader = !!vc.querySelector(
+                    'visual-container-header, visual-container-options-menu, visual-header-item-container'
+                );
+
                 results.push({
-                    index,
-                    title,
-                    x: Math.round(r.x),
-                    y: Math.round(r.y),
-                    width: Math.round(r.width),
-                    height: Math.round(r.height),
-                    type: "Tabela",
-                    hasOptionsButton: !!headerBtn,
+                    index: index,
+                    title: title || `Visual #${index + 1}`,
+                    type: type,
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    x: Math.round(rect.left),
+                    y: Math.round(rect.top),
+                    hasOptionsButton: !!optionsBtn,
+                    hasHeader: hasHeader,
                     menuOpened: false,
                     hasExportData: false,
                     exportReason: "nao_verificado",
-                    rawText: text.slice(0, 250),
+                    rawText: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 250)
                 });
             });
 
-            return JSON.stringify(results);
+            const withHeaderOrBtn = results.filter(v => v.hasHeader || v.hasOptionsButton).length;
+            return {
+                visuals: results,
+                diagnostics: {
+                    rawCount,
+                    keptCount: results.length,
+                    withHeaderOrBtn,
+                    discardedCount: rawCount - results.length,
+                    discardReasons
+                }
+            };
         })()
-    """)
+    """, default={"visuals": [], "diagnostics": {}})
 
-    try:
-        visuals = json.loads(str(raw))
-    except (json.JSONDecodeError, TypeError):
-        log.error(f"❌ Erro ao parsear visuais: {raw}")
-        return []
+    visuals = list((payload or {}).get("visuals") or [])
+    diagnostics = (payload or {}).get("diagnostics") or {}
 
-    visuals.sort(key=lambda v: (v.get("y", 0), v.get("x", 0)))
+    raw_count = int(diagnostics.get("rawCount", 0))
+    kept_count = int(diagnostics.get("keptCount", len(visuals)))
+    discarded_count = int(diagnostics.get("discardedCount", max(0, raw_count - kept_count)))
+    discard_reasons = diagnostics.get("discardReasons", {}) or {}
 
-    log.info(f"📊 Total de visual-containers: {len(visuals)}")
-    log.info(f"📋 Visuais com header de opções: {sum(1 for v in visuals if v.get('hasOptionsButton'))}")
+    log.info(f"🧪 [diagnóstico] visual-container bruto no DOM: {raw_count}")
+    log.info(f"🧪 [diagnóstico] mantidos no scan: {kept_count} | descartados: {discarded_count}")
+    if discard_reasons:
+        for reason, qty in discard_reasons.items():
+            log.info(f"🧪 [diagnóstico] descarte visual: {reason} = {qty}")
+
+    if raw_count > 0 and kept_count == 0:
+        log.warning("⚠️ Diagnóstico: havia visual-container bruto, mas todos foram descartados pelos filtros.")
+
+    # comportamento v5: prioriza visuais com header/botão; se zerar, usa todos os mantidos
+    exportable = [v for v in visuals if v.get("hasHeader") or v.get("hasOptionsButton")]
+    if not exportable and visuals:
+        log.warning("⚠️ Nenhum visual com header/botão detectado; usando lista completa (fallback v5).")
+        exportable = visuals
+
+    exportable.sort(key=lambda v: (0 if v.get('hasOptionsButton') else 1, v.get('y', 0), v.get('x', 0)))
+
+    log.info(f"📊 Total de visual-containers: {len(exportable)}")
+    log.info(f"📋 Visuais com header de opções: {sum(1 for v in exportable if v.get('hasOptionsButton'))}")
     log.info("🔬 Verificando quais visuais suportam 'Exportar dados'...")
 
-    for visual in visuals:
+    for visual in exportable:
         await close_open_menus_and_overlays(tab, aggressive=True)
         await scroll_visual_into_view(tab, visual)
         await hover_visual_center(tab, visual)
@@ -1699,8 +1738,8 @@ async def scan_visuals(tab):
         await close_open_menus_and_overlays(tab, aggressive=True)
         await asyncio.sleep(1)
 
-    log.info(f"✅ {sum(1 for v in visuals if v.get('hasExportData'))} visuais com 'Exportar dados' confirmado")
-    return visuals
+    log.info(f"✅ {sum(1 for v in exportable if v.get('hasExportData'))} visuais com 'Exportar dados' confirmado")
+    return exportable
 
 def display_visuals(visuals: list):
     """Exibe os visuais encontrados na página."""
@@ -2307,158 +2346,156 @@ async def scan_slicers(tab):
     - detectar melhor se aparentam ter filtro aplicado
     - não deixar dropdown, tooltip ou painel aberto após a leitura
     """
-    log.info("🎚️ Escaneando filtros/slicers...")
+    log.info("🎚️ Escaneando filtros/slicers (base v5)...")
     await cleanup_residual_ui(tab, stage_label="scan de slicers - início", aggressive=True)
 
-    slicers_raw = await tab.evaluate("""
+    payload = await eval_json(tab, """
         (() => {
-            const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-            const lower = (s) => (s || '').toLowerCase();
             const results = [];
-
-            const isVisible = (el) => {
-                const r = el.getBoundingClientRect();
-                return r.width > 80 && r.height > 40;
+            const containers = Array.from(document.querySelectorAll('visual-container'));
+            const norm = txt => (txt || '').replace(/\\s+/g, ' ').trim();
+            const diagnostics = {
+                rawVisualContainers: containers.length,
+                rawSlicerCandidates: 0,
+                discardedBySize: 0
             };
 
-            const isNoiseText = (txt) => {
-                const t = lower(txt);
-                return (
-                    !t ||
-                    t.includes('saiba mais') ||
-                    t.includes('learn more') ||
-                    t.includes('exportar dados') ||
-                    t.includes('mostrar como uma tabela') ||
-                    t.includes('obter insights')
+            containers.forEach((vc, index) => {
+                const el = vc.querySelector('transform') || vc;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 15 || rect.height < 15) {
+                    diagnostics.discardedBySize += 1;
+                    return;
+                }
+
+                const allClasses = [
+                    vc.className || '',
+                    el.className || '',
+                    ...Array.from(vc.querySelectorAll('[class]')).slice(0, 40).map(e => String(e.className || ''))
+                ].join(' ').toLowerCase();
+
+                const isSlicer = (
+                    allClasses.includes('slicer') ||
+                    allClasses.includes('chiclet') ||
+                    !!vc.querySelector('.slicer-container, .slicer-content-wrapper, .slicer-body, .slicerBody, [class*="Slicer"], [class*="slicer"], .chiclet-slicer')
                 );
-            };
+                if (!isSlicer) return;
+                diagnostics.rawSlicerCandidates += 1;
 
-            const classifySlicerType = (vc, txt) => {
-                const t = lower(txt);
-                if (vc.querySelector('input[type="date"], [aria-label*="date"], [aria-label*="data"]')) return 'data';
-                if (vc.querySelector('[aria-checked], [role="checkbox"], [role="option"]')) return 'chiclet';
-                if (vc.querySelector('[role="slider"], input[type="range"]')) return 'intervalo';
-                if (vc.querySelector('select, [role="combobox"], [role="listbox"]')) return 'dropdown';
-                if (t.includes('entre') || t.includes('between')) return 'intervalo';
-                return 'lista';
-            };
-
-            const visualContainers = Array.from(document.querySelectorAll('visual-container'))
-                .map((vc, index) => ({ vc, index }))
-                .filter(({ vc }) => isVisible(vc));
-
-            for (const { vc, index } of visualContainers) {
-                const rect = vc.getBoundingClientRect();
-                const fullText = textOf(vc);
-                const lowerText = lower(fullText);
-
-                const slicerSignals = [
-                    vc.querySelector('[role="listbox"]'),
-                    vc.querySelector('[role="combobox"]'),
-                    vc.querySelector('[role="option"]'),
-                    vc.querySelector('[role="checkbox"]'),
-                    vc.querySelector('[aria-checked]'),
-                    vc.querySelector('.slicer-header-text'),
-                    vc.querySelector('[class*="slicer"]'),
-                    lowerText.includes('pesquisar'),
-                    lowerText.includes('search'),
-                    lowerText.includes('ainda não aplicado'),
-                    lowerText.includes('selecione')
-                ];
-
-                const isLikelySlicer = slicerSignals.some(Boolean);
-                if (!isLikelySlicer) continue;
-
-                // título com prioridade em cabeçalho do slicer
                 let title = '';
-                const titleSelectors = [
-                    '.slicer-header-text',
-                    '[class*="slicer"] [title]',
-                    '[class*="header"] [title]',
-                    'visual-container-header [title]',
-                    '[title]'
-                ];
-                for (const sel of titleSelectors) {
-                    const nodes = vc.querySelectorAll(sel);
-                    for (const el of nodes) {
-                        const t = textOf(el);
-                        if (!t || t.length < 2 || t.length > 80) continue;
-                        if (isNoiseText(t)) continue;
-                        title = t;
-                        break;
+                const headerEl = vc.querySelector(
+                    '.slicer-header-text, [class*="header-text"], h3, h4, .visual-title, .visualTitle, [class*="title"]'
+                );
+                if (headerEl) title = norm(headerEl.textContent);
+                if (!title) {
+                    const ariaLabel = vc.getAttribute('aria-label') || el.getAttribute('aria-label') || '';
+                    title = norm(ariaLabel.replace(/\\(.*?\\)/g, ''));
+                }
+
+                let slicerType = 'lista';
+                if (allClasses.includes('chiclet')) slicerType = 'chiclet';
+                else if (vc.querySelector('input[type="range"], .slider, [class*="range"], [class*="Range"]')) slicerType = 'range';
+                else if (vc.querySelector('select, .dropdown, [class*="dropdown"], [class*="Dropdown"]')) slicerType = 'dropdown';
+                else if (vc.querySelector('.date-slicer, [class*="date-slicer"], [class*="DateSlicer"]')) slicerType = 'date';
+                else if (vc.querySelector('input[type="text"], input.searchInput')) slicerType = 'busca';
+
+                const allValues = [];
+                const selectedValues = [];
+                const seen = new Set();
+                const selectedSet = new Set();
+
+                const items = vc.querySelectorAll(
+                    '.slicerItemContainer, [class*="slicerItem"], [role="option"], [role="listitem"], .row, [class*="chiclet"]'
+                );
+                items.forEach(item => {
+                    const value = norm(
+                        item.querySelector('.slicerText, span, [class*="slicerText"], [class*="text"], label')?.textContent || item.textContent
+                    );
+                    if (!value || value.length > 80) return;
+                    const lower = value.toLowerCase();
+                    if (lower === 'selecionar tudo' || lower === 'select all') return;
+                    if (!seen.has(value)) {
+                        seen.add(value);
+                        allValues.push(value);
                     }
-                    if (title) break;
+
+                    const checkbox = item.querySelector('.slicerCheckbox, input[type="checkbox"], [class*="checkbox"], [class*="Checkbox"]');
+                    const isSelected = (
+                        item.classList.contains('selected') ||
+                        item.classList.contains('isSelected') ||
+                        item.querySelector('.selected, .isSelected, .partiallySelected') !== null ||
+                        item.getAttribute('aria-selected') === 'true' ||
+                        item.getAttribute('aria-checked') === 'true' ||
+                        (checkbox && (
+                            checkbox.checked === true ||
+                            checkbox.getAttribute('aria-checked') === 'true' ||
+                            checkbox.classList.contains('selected') ||
+                            checkbox.classList.contains('partiallySelected')
+                        ))
+                    );
+                    if (isSelected && !selectedSet.has(value)) {
+                        selectedSet.add(value);
+                        selectedValues.push(value);
+                    }
+                });
+
+                const visibleStateCandidates = [
+                    vc.querySelector('input[type="text"]')?.value,
+                    vc.querySelector('input[aria-autocomplete]')?.value,
+                    vc.querySelector('.slicer-dropdown-menu, .dropdown-value, [class*="selectedValue"], [class*="currentValue"]')?.textContent,
+                    vc.querySelector('[aria-selected="true"]')?.textContent,
+                    vc.querySelector('[aria-checked="true"]')?.textContent
+                ].map(norm).filter(Boolean);
+
+                for (const val of visibleStateCandidates) {
+                    if (!selectedSet.has(val) && val.length <= 80) {
+                        selectedSet.add(val);
+                        selectedValues.push(val);
+                    }
                 }
-                if (!title) title = `Slicer #${index + 1}`;
 
-                // indícios de filtro aplicado
-                const selectedNodes = vc.querySelectorAll(
-                    '[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, .checked'
+                const visibleText = norm(vc.textContent).toLowerCase();
+                const pendingSignals = ['ainda não aplicado', 'not yet applied', 'apply changes', 'aplicar alterações'];
+                const selectedSignals = ['múltiplos selecionados', 'multiple selections', 'selecionado', 'selected'];
+                const hasPending = pendingSignals.some(t => visibleText.includes(t));
+                const inferredFiltered = (
+                    selectedValues.length > 0 ||
+                    selectedSignals.some(t => visibleText.includes(t)) ||
+                    vc.querySelector('[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, .partiallySelected') !== null
                 );
-                const hasAppliedKeywords =
-                    lowerText.includes(' é ') ||
-                    lowerText.includes('não está em branco') ||
-                    lowerText.includes('selecionad') ||
-                    lowerText.includes('selected') ||
-                    lowerText.includes('múltipl') ||
-                    lowerText.includes('multiple');
-
-                const hasNotAppliedMarker =
-                    lowerText.includes('ainda não aplicado') ||
-                    lowerText.includes('not applied');
-
-                const applied = (selectedNodes.length > 0 || hasAppliedKeywords) && !hasNotAppliedMarker;
-
-                // valores visíveis (sem abrir dropdown/painel)
-                const visibleValues = [];
-                const valueNodes = vc.querySelectorAll(
-                    '[aria-selected="true"], [aria-checked="true"], .selected, .isSelected, ' +
-                    '.slicerText, [role="option"], li, button, span, div'
-                );
-                for (const el of valueNodes) {
-                    const t = textOf(el);
-                    const tl = lower(t);
-                    if (!t || t.length < 1 || t.length > 60) continue;
-                    if (tl === lower(title)) continue;
-                    if (isNoiseText(t)) continue;
-                    if (tl.includes('pesquisar') || tl.includes('search')) continue;
-                    if (tl.includes('ainda não aplicado') || tl.includes('not applied')) continue;
-                    if (!visibleValues.includes(t)) visibleValues.push(t);
-                    if (visibleValues.length >= 8) break;
-                }
 
                 results.push({
-                    index,
-                    title,
-                    type: classifySlicerType(vc, fullText),
+                    index: index,
+                    title: title || `Slicer #${index + 1}`,
+                    type: slicerType,
+                    values: selectedValues.length ? selectedValues.slice(0, 10) : allValues.slice(0, 10),
+                    allValues: allValues.slice(0, 50),
+                    selectedValues: selectedValues.slice(0, 50),
+                    totalValues: allValues.length,
+                    totalSelected: selectedValues.length,
+                    hasPending: hasPending,
+                    applied: inferredFiltered && !hasPending,
                     x: Math.round(rect.x),
                     y: Math.round(rect.y),
                     width: Math.round(rect.width),
                     height: Math.round(rect.height),
-                    applied,
-                    values: visibleValues,
-                    hasDropdown: !!vc.querySelector('select, [role="combobox"], [role="listbox"]'),
-                    rawText: fullText.slice(0, 300),
                 });
-            }
+            });
 
-            return JSON.stringify(results);
+            return { slicers: results, diagnostics };
         })()
-    """)
+    """, default={"slicers": [], "diagnostics": {}})
 
-    try:
-        slicers = json.loads(str(slicers_raw))
-    except (json.JSONDecodeError, TypeError):
-        log.error(f"❌ Erro ao parsear slicers: {slicers_raw}")
-        await cleanup_residual_ui(tab, stage_label="scan de slicers - erro de parse", aggressive=True)
-        return []
+    slicers = list((payload or {}).get("slicers") or [])
+    diagnostics = (payload or {}).get("diagnostics") or {}
 
-    # ordena visualmente
+    log.info(f"🧪 [diagnóstico] visual-container bruto no DOM: {int(diagnostics.get('rawVisualContainers', 0))}")
+    log.info(f"🧪 [diagnóstico] candidatos brutos a slicer: {int(diagnostics.get('rawSlicerCandidates', 0))}")
+    log.info(f"🧪 [diagnóstico] descartados por tamanho (slicer scan): {int(diagnostics.get('discardedBySize', 0))}")
+
     slicers.sort(key=lambda s: (s.get("y", 0), s.get("x", 0)))
 
-    # limpeza importante: não deixar nada aberto após o scan
     await cleanup_residual_ui(tab, stage_label="scan de slicers - final", aggressive=True)
-
     return slicers
 
 
