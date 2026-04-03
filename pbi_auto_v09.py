@@ -3133,6 +3133,135 @@ async def scan_slicers(tab):
         except Exception as se:
             return {"error": str(se)}
 
+    def _sanitize_candidate_values(raw_values: list[str], field_name_local: str) -> tuple[list[str], list[str]]:
+        drop_exact = {
+            "selecionar tudo", "select all", "ainda não aplicado", "not yet applied",
+            "apply changes", "aplicar alterações", "basic", "search", "buscar", "pesquisar",
+        }
+        filtered, discarded = [], []
+        for v in raw_values or []:
+            t = (v or "").strip()
+            if not t:
+                continue
+            low = t.lower()
+            if (
+                low in drop_exact
+                or low == field_name_local
+                or low.startswith("pressionar enter")
+                or (low.startswith("(") and low.endswith(")"))
+            ):
+                discarded.append(t)
+                continue
+            filtered.append(t)
+        return sorted(list(dict.fromkeys(filtered))), sorted(list(dict.fromkeys(discarded)))
+
+    async def _find_list_container(idx_snap: int) -> dict:
+        try:
+            raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify({{found:false, reason:'no_vc'}});
+                    const candidates = Array.from(vc.querySelectorAll('*')).filter(el => {{
+                        const cs = getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 20 || r.height < 20) return false;
+                        const hasItems = el.querySelectorAll('.slicerItemContainer,[role="option"],[role="listitem"],div.row').length > 0;
+                        const scrollable = el.scrollHeight > el.clientHeight + 2;
+                        const ov = (cs.overflowY || '').toLowerCase();
+                        return hasItems && (scrollable || ov.includes('auto') || ov.includes('scroll'));
+                    }});
+                    let best = null;
+                    if (candidates.length) {{
+                        best = candidates.sort((a,b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+                    }}
+                    if (!best) {{
+                        const lb = vc.querySelector('[role="listbox"]');
+                        if (lb) best = lb;
+                    }}
+                    if (!best) return JSON.stringify({{found:false, reason:'no_scrollable_candidate'}});
+                    const cs = getComputedStyle(best);
+                    const visible = Array.from(best.querySelectorAll('.slicerItemContainer,[role="option"],[role="listitem"],div.row'))
+                        .filter(el => el.getBoundingClientRect().height > 0)
+                        .map(el => (el.textContent || '').trim())
+                        .filter(Boolean)
+                        .slice(0,80);
+                    return JSON.stringify({{
+                        found:true,
+                        tag: best.tagName,
+                        class: String(best.className || '').slice(0,120),
+                        role: best.getAttribute('role') || '',
+                        scrollTop: best.scrollTop || 0,
+                        scrollHeight: best.scrollHeight || 0,
+                        clientHeight: best.clientHeight || 0,
+                        overflowY: (cs.overflowY || ''),
+                        visible_items: visible
+                    }});
+                }})()
+            """)
+            return _j.loads(str(raw)) if raw else {"found": False}
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+
+    async def _scroll_list_container(idx_snap: int, delta: int = 180) -> dict:
+        try:
+            raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify({{ok:false, reason:'no_vc'}});
+                    const itemSelector = '.slicerItemContainer,[role="option"],[role="listitem"],div.row';
+                    const candidates = Array.from(vc.querySelectorAll('*')).filter(el => {{
+                        const cs = getComputedStyle(el);
+                        const hasItems = el.querySelectorAll(itemSelector).length > 0;
+                        const ov = (cs.overflowY || '').toLowerCase();
+                        return hasItems && ((el.scrollHeight > el.clientHeight + 2) || ov.includes('auto') || ov.includes('scroll'));
+                    }});
+                    const target = candidates[0] || vc.querySelector('[role="listbox"]');
+                    if (!target) return JSON.stringify({{ok:false, reason:'no_target'}});
+                    const before = target.scrollTop || 0;
+                    target.scrollTop = before + {delta};
+                    const after = target.scrollTop || 0;
+                    const vis = Array.from(target.querySelectorAll(itemSelector))
+                        .filter(el => el.getBoundingClientRect().height > 0)
+                        .map(el => (el.textContent || '').trim())
+                        .filter(Boolean)
+                        .slice(0,80);
+                    return JSON.stringify({{
+                        ok: true,
+                        scrollTop_before: before,
+                        scrollTop_after: after,
+                        moved: after !== before,
+                        visible_items: vis
+                    }});
+                }})()
+            """)
+            return _j.loads(str(raw)) if raw else {"ok": False}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def _read_selected_values(idx_snap: int) -> list[str]:
+        try:
+            raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify([]);
+                    const out = [];
+                    vc.querySelectorAll('.slicerItemContainer,[role="option"],[role="listitem"],div.row').forEach(item => {{
+                        const isSel = item.classList.contains('selected') ||
+                            item.classList.contains('isSelected') ||
+                            item.getAttribute('aria-selected') === 'true' ||
+                            item.getAttribute('aria-checked') === 'true';
+                        if (isSel) {{
+                            const t = (item.textContent || '').trim();
+                            if (t) out.push(t);
+                        }}
+                    }});
+                    return JSON.stringify([...new Set(out)].slice(0,80));
+                }})()
+            """)
+            return _j.loads(str(raw)) if raw else []
+        except Exception:
+            return []
+
     for slicer in slicers:
         idx        = slicer["index"]
         title      = slicer.get("title", f"Slicer #{idx}")
@@ -3387,21 +3516,45 @@ async def scan_slicers(tab):
         if winner:
             pre_enter = await _slicer_focus_snapshot(idx)
             click_before = dict(pre_enter)
+            blocked_click_on_value_item = False
             if not pre_enter.get("in_slicer"):
                 if winner_coords:
-                    await _cdp_click(tab, winner_coords.get("x", 0), winner_coords.get("y", 0))
-                    await asyncio.sleep(0.2)
+                    target_info_raw = await tab.evaluate(f"""
+                        (() => {{
+                            const el = document.elementFromPoint({winner_coords.get("x", 0)}, {winner_coords.get("y", 0)});
+                            if (!el) return JSON.stringify({{ok:false}});
+                            const item = el.closest('.slicerItemContainer,[role="option"],[role="listitem"],div.row');
+                            return JSON.stringify({{
+                                ok:true,
+                                is_value_item: !!item,
+                                target_text: (item ? item.textContent : el.textContent || '').trim().slice(0,80),
+                                target_class: String((item || el).className || '').slice(0,120)
+                            }});
+                        }})()
+                    """)
+                    target_info = _j.loads(str(target_info_raw)) if target_info_raw else {}
+                    if target_info.get("is_value_item"):
+                        blocked_click_on_value_item = True
+                        log.info("    [BLOCKED_VALUE_CLICK]")
+                        log.info(f"    slicer={title}")
+                        log.info(f"    target_text={target_info.get('target_text')}")
+                        log.info(f"    target_class={target_info.get('target_class')}")
+                        log.info("    reason=value_item_click_forbidden")
+                    else:
+                        await _cdp_click(tab, winner_coords.get("x", 0), winner_coords.get("y", 0))
+                        await asyncio.sleep(0.2)
                 pre_enter = await _slicer_focus_snapshot(idx)
             click_after = dict(pre_enter)
 
             log.info("    [CLICK_ACTIVATION]")
             log.info(f"    slicer={title}")
-            log.info("    target=B")
-            log.info(f"    cdp_click={bool(winner_coords)}")
+            log.info(f"    strategy={winner}")
+            log.info(f"    cdp_click={bool(winner_coords) and (not blocked_click_on_value_item)}")
             log.info(f"    activeElement_before={click_before.get('activeElement')}")
             log.info(f"    activeElement_after={click_after.get('activeElement')}")
             log.info(f"    in_slicer_before={click_before.get('in_slicer')}")
             log.info(f"    in_slicer_after={click_after.get('in_slicer')}")
+            log.info(f"    blocked_click_on_value_item={blocked_click_on_value_item}")
 
             enter_diag = await _cdp_key_event(tab, "Enter")
             await asyncio.sleep(0.35)
@@ -3429,59 +3582,84 @@ async def scan_slicers(tab):
                 log.info("    ❌ ENTER falhou; ArrowDown bloqueado para este slicer.")
 
         if winner and enter_success:
-            discovered_values = set(slicer.get("allValues") or [])
-            no_change_rounds = 0
-            steps_done = 0
-            for step in range(1, 10):
-                before_arrow = await _slicer_focus_snapshot(idx)
-                if not before_arrow.get("in_slicer"):
-                    if winner_coords:
-                        await _cdp_click(tab, winner_coords.get("x", 0), winner_coords.get("y", 0))
-                        await asyncio.sleep(0.2)
-                    before_arrow = await _slicer_focus_snapshot(idx)
-
-                arrow_diag = await _cdp_key_event(tab, "ArrowDown")
-                await asyncio.sleep(0.3)
-                after_arrow = await _slicer_focus_snapshot(idx)
-                steps_done = step
-
-                before_vals = set(before_arrow.get("values") or [])
-                after_vals = set(after_arrow.get("values") or [])
-                new_vals = sorted(v for v in (after_vals - before_vals) if v)
-                discovered_values.update(new_vals)
-
-                log.info("    [ARROWDOWN]")
-                log.info(f"    slicer={title}")
-                log.info(f"    cdp_ok={(arrow_diag or {}).get('cdp_ok')}")
-                log.info(f"    step={step}")
-                log.info(f"    activeElement={after_arrow.get('activeElement')}")
-                log.info(f"    in_slicer={after_arrow.get('in_slicer')}")
-                log.info(f"    explore_mode={after_arrow.get('explore_mode')}")
-                log.info(f"    visible_items_before={before_arrow.get('visible_items')}")
-                log.info(f"    visible_items_after={after_arrow.get('visible_items')}")
-                log.info(f"    new_values_detected={new_vals}")
-                log.info(f"    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
-
-                if not (arrow_diag or {}).get("cdp_ok"):
-                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=cdp_arrow_failed\n    steps={steps_done}\n    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
-                    break
-                if not after_arrow.get("in_slicer"):
-                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=focus_left_slicer\n    steps={steps_done}\n    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
-                    break
-                if new_vals:
-                    no_change_rounds = 0
-                else:
-                    no_change_rounds += 1
-                if no_change_rounds >= 3:
-                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=no_new_values_3_rounds\n    steps={steps_done}\n    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
-                    break
-
-            final_unique = sorted([v for v in discovered_values if v])
             passive_initial = sorted([v for v in (slicer.get("allValues") or []) if v])
-            log.info(
-                f"    [VALUES_COMPARE] slicer={title} passive_count={len(passive_initial)} "
-                f"final_count={len(final_unique)} new_values_revealed={len(final_unique) > len(passive_initial)}"
-            )
+            selected_before = await _read_selected_values(idx)
+            list_meta = await _find_list_container(idx)
+            log.info("    [LIST_CONTAINER]")
+            log.info(f"    slicer={title}")
+            log.info(f"    found={list_meta.get('found')}")
+            log.info(f"    tag={list_meta.get('tag')}")
+            log.info(f"    class={list_meta.get('class')}")
+            log.info(f"    role={list_meta.get('role')}")
+            log.info(f"    scrollTop={list_meta.get('scrollTop')}")
+            log.info(f"    scrollHeight={list_meta.get('scrollHeight')}")
+            log.info(f"    clientHeight={list_meta.get('clientHeight')}")
+            log.info(f"    overflowY={list_meta.get('overflowY')}")
+
+            discovered_values = set(passive_initial)
+            discarded_values = set()
+            steps_done = 0
+            no_change_rounds = 0
+
+            for step in range(1, 12):
+                steps_done = step
+                scroll_result = await _scroll_list_container(idx, delta=180)
+                await asyncio.sleep(0.35)
+                post_scroll = await _slicer_focus_snapshot(idx)
+                selected_after = await _read_selected_values(idx)
+                selection_side_effect = selected_after != selected_before
+
+                raw_visible = scroll_result.get("visible_items") or post_scroll.get("values") or []
+                filtered_values, discarded = _sanitize_candidate_values(raw_visible, field_name)
+                before_set = set(discovered_values)
+                discovered_values.update(filtered_values)
+                discarded_values.update(discarded)
+                new_vals = sorted(list(set(discovered_values) - before_set))
+
+                log.info("    [ENUM_SCROLL]")
+                log.info(f"    slicer={title}")
+                log.info(f"    step={step}")
+                log.info(f"    scrollTop_before={scroll_result.get('scrollTop_before')}")
+                log.info(f"    scrollTop_after={scroll_result.get('scrollTop_after')}")
+                log.info(f"    visible_items_before={list_meta.get('visible_items') if step == 1 else 'see_previous_step'}")
+                log.info(f"    visible_items_after={raw_visible}")
+                log.info(f"    raw_texts_visible={raw_visible}")
+                log.info(f"    filtered_candidate_values={filtered_values}")
+                log.info(f"    discarded_texts={discarded}")
+                log.info(f"    new_values_detected={new_vals}")
+                log.info(f"    all_unique_values={sorted(list(discovered_values))[:120]}")
+                log.info(f"    selection_side_effect_detected={selection_side_effect}")
+                log.info(f"    selected_values_before={selected_before}")
+                log.info(f"    selected_values_after={selected_after}")
+
+                if selection_side_effect:
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=selection_side_effect\n    steps={steps_done}\n    all_unique_values={sorted(list(discovered_values))[:120]}")
+                    break
+                if not scroll_result.get("ok"):
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=scroll_failed\n    steps={steps_done}\n    all_unique_values={sorted(list(discovered_values))[:120]}")
+                    break
+                if scroll_result.get("scrollTop_after") == scroll_result.get("scrollTop_before"):
+                    no_change_rounds += 1
+                elif not new_vals:
+                    no_change_rounds += 1
+                else:
+                    no_change_rounds = 0
+
+                if no_change_rounds >= 3:
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=stabilized_no_progress\n    steps={steps_done}\n    all_unique_values={sorted(list(discovered_values))[:120]}")
+                    break
+
+            final_unique = sorted(list(discovered_values))
+            log.info("    [VALUES_COMPARE]")
+            log.info(f"    slicer={title}")
+            log.info(f"    passive_values={passive_initial}")
+            log.info(f"    final_values={final_unique}")
+            log.info(f"    new_values_revealed={len(final_unique) > len(passive_initial)}")
+            log.info(f"    discarded_texts={sorted(list(discarded_values))[:120]}")
+
+            if final_unique:
+                slicer["allValues"] = final_unique
+                slicer["totalValues"] = len(final_unique)
 
         # Coleta valores (ativado ou passivo)
         try:
