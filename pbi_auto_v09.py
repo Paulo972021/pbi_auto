@@ -2537,6 +2537,185 @@ def cdp_dict_event(event_type: str, x: int, y: int) -> dict:
         }
     }
 
+
+def cdp_dict_key_event(event_type: str, key_payload: dict) -> dict:
+    """
+    Monta evento de teclado via dicionário raw para Input.dispatchKeyEvent.
+    """
+    params = {"type": event_type}
+    params.update(key_payload or {})
+    return {
+        "method": "Input.dispatchKeyEvent",
+        "params": params,
+    }
+
+
+def _key_payload(key_name: str) -> dict:
+    """
+    Mapeia teclas suportadas para payload CDP.
+    """
+    mapping = {
+        "Enter": {
+            "key": "Enter",
+            "code": "Enter",
+            "text": "\r",
+            "unmodified_text": "\r",
+            "windows_virtual_key_code": 13,
+            "native_virtual_key_code": 13,
+        },
+        "ArrowDown": {
+            "key": "ArrowDown",
+            "code": "ArrowDown",
+            "text": "",
+            "unmodified_text": "",
+            "windows_virtual_key_code": 40,
+            "native_virtual_key_code": 40,
+        },
+    }
+    return dict(mapping.get(key_name, {}))
+
+
+def _key_payload_raw_from_typed(typed_payload: dict) -> dict:
+    """
+    Converte payload snake_case (API tipada) para camelCase (CDP raw).
+    """
+    return {
+        "key": typed_payload.get("key", ""),
+        "code": typed_payload.get("code", ""),
+        "text": typed_payload.get("text", ""),
+        "unmodifiedText": typed_payload.get("unmodified_text", ""),
+        "windowsVirtualKeyCode": typed_payload.get("windows_virtual_key_code", 0),
+        "nativeVirtualKeyCode": typed_payload.get("native_virtual_key_code", 0),
+    }
+
+
+async def _send_raw_cdp(tab, method: str, params: dict) -> bool:
+    """
+    Tenta enviar comando CDP raw por caminhos compatíveis com versões distintas.
+    """
+    msg = {"method": method, "params": params or {}}
+    attempts = []
+
+    # Caminhos conhecidos/possíveis de envio
+    if hasattr(tab, "send"):
+        attempts.append(("tab.send(dict)", tab.send, msg))
+
+    conn = getattr(tab, "connection", None) or getattr(tab, "_connection", None)
+    if conn and hasattr(conn, "send"):
+        attempts.append(("tab.connection.send", conn.send, method, params))
+
+    browser = getattr(tab, "browser", None)
+    bconn = getattr(browser, "connection", None) if browser else None
+    if bconn and hasattr(bconn, "send"):
+        attempts.append(("browser.connection.send", bconn.send, method, params))
+
+    for item in attempts:
+        try:
+            fn = item[1]
+            args = item[2:]
+            out = fn(*args)
+            if asyncio.iscoroutine(out):
+                await out
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _cdp_key_event(tab, key_name: str) -> dict:
+    """
+    Envia evento de tecla em sequência keyDown -> (char) -> keyUp.
+    Retorna diagnóstico completo da tentativa de envio da tecla.
+    """
+    payload = _key_payload(key_name)
+    if not payload:
+        log.info(f"    ❌ [_cdp_key_event] tecla não suportada: {key_name}")
+        return {"cdp_ok": False, "typed_api_ok": False, "raw_api_ok": False}
+
+    typed_ok = False
+    try:
+        # Tentativa 1: API tipada do nodriver (snake_case)
+        await tab.send(uc.cdp.input_.dispatch_key_event(type_="keyDown", **payload))
+        if payload.get("text"):
+            await tab.send(uc.cdp.input_.dispatch_key_event(type_="char", **payload))
+        await tab.send(uc.cdp.input_.dispatch_key_event(type_="keyUp", **payload))
+        typed_ok = True
+    except Exception as e1:
+        log.info(f"    ⚠️ [_cdp_key_event] API tipada falhou ({key_name}): {e1}")
+
+    raw_ok = False
+    raw_payload = _key_payload_raw_from_typed(payload)
+    try:
+        down_ok = await _send_raw_cdp(tab, "Input.dispatchKeyEvent", {"type": "keyDown", **raw_payload})
+        char_ok = True
+        if raw_payload.get("text"):
+            char_ok = await _send_raw_cdp(tab, "Input.dispatchKeyEvent", {"type": "char", **raw_payload})
+        up_ok = await _send_raw_cdp(tab, "Input.dispatchKeyEvent", {"type": "keyUp", **raw_payload})
+        raw_ok = bool(down_ok and char_ok and up_ok)
+    except Exception as e2:
+        log.info(f"    ❌ [_cdp_key_event] raw falhou ({key_name}): {e2}")
+
+    return {
+        "cdp_ok": bool(typed_ok or raw_ok),
+        "typed_api_ok": bool(typed_ok),
+        "raw_api_ok": bool(raw_ok),
+    }
+
+
+async def _simple_keyboard_probe(tab) -> dict:
+    """
+    Valida ENTER e ArrowDown fora do Power BI em um input simples.
+    """
+    result = {"ok": False, "enter_ok": False, "arrow_ok": False}
+    try:
+        await tab.evaluate("""
+            (() => {
+                const id = '__pbi_keyboard_probe__';
+                let wrap = document.getElementById(id);
+                if (!wrap) {
+                    wrap = document.createElement('div');
+                    wrap.id = id;
+                    wrap.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;background:#fff;padding:4px;border:1px solid #999;';
+                    wrap.innerHTML = '<input id="__pbi_keyboard_probe_input__" style="width:180px" value="" />';
+                    document.body.appendChild(wrap);
+                }
+            })()
+        """)
+        await tab.evaluate("document.getElementById('__pbi_keyboard_probe_input__')?.focus()")
+        await asyncio.sleep(0.1)
+
+        enter_diag = await _cdp_key_event(tab, "Enter")
+        await asyncio.sleep(0.1)
+        arrow_diag = await _cdp_key_event(tab, "ArrowDown")
+        await asyncio.sleep(0.1)
+
+        probe_raw = await tab.evaluate("""
+            (() => {
+                const i = document.getElementById('__pbi_keyboard_probe_input__');
+                if (!i) return JSON.stringify({exists:false});
+                return JSON.stringify({
+                    exists: true,
+                    focused: document.activeElement === i,
+                    value: i.value || ''
+                });
+            })()
+        """)
+        probe_data = json.loads(str(probe_raw)) if probe_raw else {}
+        result = {
+            "ok": bool(probe_data.get("exists")),
+            "enter_ok": bool((enter_diag or {}).get("cdp_ok")),
+            "arrow_ok": bool((arrow_diag or {}).get("cdp_ok")),
+            "enter_typed_api_ok": bool((enter_diag or {}).get("typed_api_ok")),
+            "enter_raw_api_ok": bool((enter_diag or {}).get("raw_api_ok")),
+            "arrow_typed_api_ok": bool((arrow_diag or {}).get("typed_api_ok")),
+            "arrow_raw_api_ok": bool((arrow_diag or {}).get("raw_api_ok")),
+            "focused": probe_data.get("focused"),
+            "value": probe_data.get("value"),
+        }
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
 async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
     """
     Executa os 4 experimentos do documento de orientação para descobrir
@@ -2924,6 +3103,165 @@ async def scan_slicers(tab):
         'apply changes', 'aplicar alterações', '(ainda não aplicado)',
     }
 
+    keyboard_probe_done = False
+
+    async def _slicer_focus_snapshot(idx_snap: int) -> dict:
+        try:
+            snap_raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify({{error:'no_vc'}});
+                    const ae = document.activeElement;
+                    const visible = Array.from(vc.querySelectorAll(
+                        '.slicerItemContainer, div.row, [class*="slicerItem"]'
+                    )).filter(e => e.getBoundingClientRect().height > 0);
+                    const values = visible.map(e => (e.textContent || '').trim()).filter(Boolean);
+                    const aeDesc = ae ? `${{ae.tagName}}#${{ae.id||''}}.${{String(ae.className||'').split(' ').slice(0,2).join('.')}}` : 'null';
+                    return JSON.stringify({{
+                        activeElement: aeDesc,
+                        in_slicer: !!(vc && ae && vc.contains(ae)),
+                        visible_items: visible.length,
+                        values: [...new Set(values)].slice(0, 60),
+                        explore_mode: !!(
+                            vc.querySelector('[role="listbox"], [role="option"], [aria-expanded="true"]') ||
+                            (ae && (ae.tagName === 'INPUT' || ae.getAttribute('role') === 'listbox'))
+                        )
+                    }});
+                }})()
+            """)
+            return _j.loads(str(snap_raw)) if snap_raw else {}
+        except Exception as se:
+            return {"error": str(se)}
+
+    def _sanitize_candidate_values(raw_values: list[str], field_name_local: str) -> tuple[list[str], list[str]]:
+        drop_exact = {
+            "selecionar tudo", "select all", "ainda não aplicado", "not yet applied",
+            "apply changes", "aplicar alterações", "basic", "search", "buscar", "pesquisar",
+        }
+        filtered, discarded = [], []
+        for v in raw_values or []:
+            t = (v or "").strip()
+            if not t:
+                continue
+            low = t.lower()
+            if (
+                low in drop_exact
+                or low == field_name_local
+                or low.startswith("pressionar enter")
+                or (low.startswith("(") and low.endswith(")"))
+            ):
+                discarded.append(t)
+                continue
+            filtered.append(t)
+        return sorted(list(dict.fromkeys(filtered))), sorted(list(dict.fromkeys(discarded)))
+
+    async def _find_list_container(idx_snap: int) -> dict:
+        try:
+            raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify({{found:false, reason:'no_vc'}});
+                    const candidates = Array.from(vc.querySelectorAll('*')).filter(el => {{
+                        const cs = getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 20 || r.height < 20) return false;
+                        const hasItems = el.querySelectorAll('.slicerItemContainer,[role="option"],[role="listitem"],div.row').length > 0;
+                        const scrollable = el.scrollHeight > el.clientHeight + 2;
+                        const ov = (cs.overflowY || '').toLowerCase();
+                        return hasItems && (scrollable || ov.includes('auto') || ov.includes('scroll'));
+                    }});
+                    let best = null;
+                    if (candidates.length) {{
+                        best = candidates.sort((a,b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+                    }}
+                    if (!best) {{
+                        const lb = vc.querySelector('[role="listbox"]');
+                        if (lb) best = lb;
+                    }}
+                    if (!best) return JSON.stringify({{found:false, reason:'no_scrollable_candidate'}});
+                    const cs = getComputedStyle(best);
+                    const visible = Array.from(best.querySelectorAll('.slicerItemContainer,[role="option"],[role="listitem"],div.row'))
+                        .filter(el => el.getBoundingClientRect().height > 0)
+                        .map(el => (el.textContent || '').trim())
+                        .filter(Boolean)
+                        .slice(0,80);
+                    return JSON.stringify({{
+                        found:true,
+                        tag: best.tagName,
+                        class: String(best.className || '').slice(0,120),
+                        role: best.getAttribute('role') || '',
+                        scrollTop: best.scrollTop || 0,
+                        scrollHeight: best.scrollHeight || 0,
+                        clientHeight: best.clientHeight || 0,
+                        overflowY: (cs.overflowY || ''),
+                        visible_items: visible
+                    }});
+                }})()
+            """)
+            return _j.loads(str(raw)) if raw else {"found": False}
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+
+    async def _scroll_list_container(idx_snap: int, delta: int = 180) -> dict:
+        try:
+            raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify({{ok:false, reason:'no_vc'}});
+                    const itemSelector = '.slicerItemContainer,[role="option"],[role="listitem"],div.row';
+                    const candidates = Array.from(vc.querySelectorAll('*')).filter(el => {{
+                        const cs = getComputedStyle(el);
+                        const hasItems = el.querySelectorAll(itemSelector).length > 0;
+                        const ov = (cs.overflowY || '').toLowerCase();
+                        return hasItems && ((el.scrollHeight > el.clientHeight + 2) || ov.includes('auto') || ov.includes('scroll'));
+                    }});
+                    const target = candidates[0] || vc.querySelector('[role="listbox"]');
+                    if (!target) return JSON.stringify({{ok:false, reason:'no_target'}});
+                    const before = target.scrollTop || 0;
+                    target.scrollTop = before + {delta};
+                    const after = target.scrollTop || 0;
+                    const vis = Array.from(target.querySelectorAll(itemSelector))
+                        .filter(el => el.getBoundingClientRect().height > 0)
+                        .map(el => (el.textContent || '').trim())
+                        .filter(Boolean)
+                        .slice(0,80);
+                    return JSON.stringify({{
+                        ok: true,
+                        scrollTop_before: before,
+                        scrollTop_after: after,
+                        moved: after !== before,
+                        visible_items: vis
+                    }});
+                }})()
+            """)
+            return _j.loads(str(raw)) if raw else {"ok": False}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def _read_selected_values(idx_snap: int) -> list[str]:
+        try:
+            raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify([]);
+                    const out = [];
+                    vc.querySelectorAll('.slicerItemContainer,[role="option"],[role="listitem"],div.row').forEach(item => {{
+                        const isSel = item.classList.contains('selected') ||
+                            item.classList.contains('isSelected') ||
+                            item.getAttribute('aria-selected') === 'true' ||
+                            item.getAttribute('aria-checked') === 'true';
+                        if (isSel) {{
+                            const t = (item.textContent || '').trim();
+                            if (t) out.push(t);
+                        }}
+                    }});
+                    return JSON.stringify([...new Set(out)].slice(0,80));
+                }})()
+            """)
+            return _j.loads(str(raw)) if raw else []
+        except Exception:
+            return []
+
     for slicer in slicers:
         idx        = slicer["index"]
         title      = slicer.get("title", f"Slicer #{idx}")
@@ -3130,6 +3468,9 @@ async def scan_slicers(tab):
 
         if winner:
             winner_coords = exp["winner_coords"]
+            if exp.get("evidence", {}).get("B", {}).get("activated"):
+                winner = "B"
+                winner_coords = (exp.get("evidence", {}).get("B", {}) or {}).get("coords") or winner_coords
             log.info(f"    ✅ Visual ativado via tentativa {winner} — coletando valores...")
             await asyncio.sleep(0.5)
 
@@ -3155,6 +3496,170 @@ async def scan_slicers(tab):
                     pass
         else:
             log.info(f"    ⚠️ Nenhuma tentativa ativou o visual — coletando DOM passivo")
+
+        # Validação de teclado fora do Power BI (uma vez por execução)
+        if not keyboard_probe_done:
+            probe = await _simple_keyboard_probe(tab)
+            log.info(
+                f"    [KEYBOARD_PROBE] ok={probe.get('ok')} "
+                f"enter_ok={probe.get('enter_ok')} arrow_ok={probe.get('arrow_ok')} "
+                f"focused={probe.get('focused')} "
+                f"enter_typed={probe.get('enter_typed_api_ok')} enter_raw={probe.get('enter_raw_api_ok')} "
+                f"arrow_typed={probe.get('arrow_typed_api_ok')} arrow_raw={probe.get('arrow_raw_api_ok')}"
+            )
+            if probe.get("error"):
+                log.info(f"    [KEYBOARD_PROBE] error={probe.get('error')}")
+            keyboard_probe_done = True
+
+        # Fluxo de teclado no slicer: ENTER -> ArrowDown (somente se ENTER funcionar)
+        enter_success = False
+        if winner:
+            pre_enter = await _slicer_focus_snapshot(idx)
+            click_before = dict(pre_enter)
+            blocked_click_on_value_item = False
+            if not pre_enter.get("in_slicer"):
+                if winner_coords:
+                    target_info_raw = await tab.evaluate(f"""
+                        (() => {{
+                            const el = document.elementFromPoint({winner_coords.get("x", 0)}, {winner_coords.get("y", 0)});
+                            if (!el) return JSON.stringify({{ok:false}});
+                            const item = el.closest('.slicerItemContainer,[role="option"],[role="listitem"],div.row');
+                            return JSON.stringify({{
+                                ok:true,
+                                is_value_item: !!item,
+                                target_text: (item ? item.textContent : el.textContent || '').trim().slice(0,80),
+                                target_class: String((item || el).className || '').slice(0,120)
+                            }});
+                        }})()
+                    """)
+                    target_info = _j.loads(str(target_info_raw)) if target_info_raw else {}
+                    if target_info.get("is_value_item"):
+                        blocked_click_on_value_item = True
+                        log.info("    [BLOCKED_VALUE_CLICK]")
+                        log.info(f"    slicer={title}")
+                        log.info(f"    target_text={target_info.get('target_text')}")
+                        log.info(f"    target_class={target_info.get('target_class')}")
+                        log.info("    reason=value_item_click_forbidden")
+                    else:
+                        await _cdp_click(tab, winner_coords.get("x", 0), winner_coords.get("y", 0))
+                        await asyncio.sleep(0.2)
+                pre_enter = await _slicer_focus_snapshot(idx)
+            click_after = dict(pre_enter)
+
+            log.info("    [CLICK_ACTIVATION]")
+            log.info(f"    slicer={title}")
+            log.info(f"    strategy={winner}")
+            log.info(f"    cdp_click={bool(winner_coords) and (not blocked_click_on_value_item)}")
+            log.info(f"    activeElement_before={click_before.get('activeElement')}")
+            log.info(f"    activeElement_after={click_after.get('activeElement')}")
+            log.info(f"    in_slicer_before={click_before.get('in_slicer')}")
+            log.info(f"    in_slicer_after={click_after.get('in_slicer')}")
+            log.info(f"    blocked_click_on_value_item={blocked_click_on_value_item}")
+
+            enter_diag = await _cdp_key_event(tab, "Enter")
+            await asyncio.sleep(0.35)
+            post_enter = await _slicer_focus_snapshot(idx)
+
+            log.info("    [ENTER]")
+            log.info(f"    slicer={title}")
+            log.info(f"    cdp_ok={(enter_diag or {}).get('cdp_ok')}")
+            log.info(f"    typed_api_ok={(enter_diag or {}).get('typed_api_ok')}")
+            log.info(f"    raw_api_ok={(enter_diag or {}).get('raw_api_ok')}")
+            log.info(f"    activeElement_before={pre_enter.get('activeElement')}")
+            log.info(f"    activeElement_after={post_enter.get('activeElement')}")
+            log.info(f"    in_slicer_before={pre_enter.get('in_slicer')}")
+            log.info(f"    in_slicer_after={post_enter.get('in_slicer')}")
+            log.info(f"    explore_mode_before={pre_enter.get('explore_mode')}")
+            log.info(f"    explore_mode_after={post_enter.get('explore_mode')}")
+
+            # Enter é considerado funcional quando CDP foi OK e o foco permanece no slicer.
+            enter_success = bool(
+                (enter_diag or {}).get("cdp_ok")
+                and post_enter.get("in_slicer")
+                and (post_enter.get("explore_mode") or post_enter.get("visible_items", 0) >= pre_enter.get("visible_items", 0))
+            )
+            if not enter_success:
+                log.info("    ❌ ENTER falhou; ArrowDown bloqueado para este slicer.")
+
+        if winner and enter_success:
+            passive_initial = sorted([v for v in (slicer.get("allValues") or []) if v])
+            selected_before = await _read_selected_values(idx)
+            list_meta = await _find_list_container(idx)
+            log.info("    [LIST_CONTAINER]")
+            log.info(f"    slicer={title}")
+            log.info(f"    found={list_meta.get('found')}")
+            log.info(f"    tag={list_meta.get('tag')}")
+            log.info(f"    class={list_meta.get('class')}")
+            log.info(f"    role={list_meta.get('role')}")
+            log.info(f"    scrollTop={list_meta.get('scrollTop')}")
+            log.info(f"    scrollHeight={list_meta.get('scrollHeight')}")
+            log.info(f"    clientHeight={list_meta.get('clientHeight')}")
+            log.info(f"    overflowY={list_meta.get('overflowY')}")
+
+            discovered_values = set(passive_initial)
+            discarded_values = set()
+            steps_done = 0
+            no_change_rounds = 0
+
+            for step in range(1, 12):
+                steps_done = step
+                scroll_result = await _scroll_list_container(idx, delta=180)
+                await asyncio.sleep(0.35)
+                post_scroll = await _slicer_focus_snapshot(idx)
+                selected_after = await _read_selected_values(idx)
+                selection_side_effect = selected_after != selected_before
+
+                raw_visible = scroll_result.get("visible_items") or post_scroll.get("values") or []
+                filtered_values, discarded = _sanitize_candidate_values(raw_visible, field_name)
+                before_set = set(discovered_values)
+                discovered_values.update(filtered_values)
+                discarded_values.update(discarded)
+                new_vals = sorted(list(set(discovered_values) - before_set))
+
+                log.info("    [ENUM_SCROLL]")
+                log.info(f"    slicer={title}")
+                log.info(f"    step={step}")
+                log.info(f"    scrollTop_before={scroll_result.get('scrollTop_before')}")
+                log.info(f"    scrollTop_after={scroll_result.get('scrollTop_after')}")
+                log.info(f"    visible_items_before={list_meta.get('visible_items') if step == 1 else 'see_previous_step'}")
+                log.info(f"    visible_items_after={raw_visible}")
+                log.info(f"    raw_texts_visible={raw_visible}")
+                log.info(f"    filtered_candidate_values={filtered_values}")
+                log.info(f"    discarded_texts={discarded}")
+                log.info(f"    new_values_detected={new_vals}")
+                log.info(f"    all_unique_values={sorted(list(discovered_values))[:120]}")
+                log.info(f"    selection_side_effect_detected={selection_side_effect}")
+                log.info(f"    selected_values_before={selected_before}")
+                log.info(f"    selected_values_after={selected_after}")
+
+                if selection_side_effect:
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=selection_side_effect\n    steps={steps_done}\n    all_unique_values={sorted(list(discovered_values))[:120]}")
+                    break
+                if not scroll_result.get("ok"):
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=scroll_failed\n    steps={steps_done}\n    all_unique_values={sorted(list(discovered_values))[:120]}")
+                    break
+                if scroll_result.get("scrollTop_after") == scroll_result.get("scrollTop_before"):
+                    no_change_rounds += 1
+                elif not new_vals:
+                    no_change_rounds += 1
+                else:
+                    no_change_rounds = 0
+
+                if no_change_rounds >= 3:
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=stabilized_no_progress\n    steps={steps_done}\n    all_unique_values={sorted(list(discovered_values))[:120]}")
+                    break
+
+            final_unique = sorted(list(discovered_values))
+            log.info("    [VALUES_COMPARE]")
+            log.info(f"    slicer={title}")
+            log.info(f"    passive_values={passive_initial}")
+            log.info(f"    final_values={final_unique}")
+            log.info(f"    new_values_revealed={len(final_unique) > len(passive_initial)}")
+            log.info(f"    discarded_texts={sorted(list(discarded_values))[:120]}")
+
+            if final_unique:
+                slicer["allValues"] = final_unique
+                slicer["totalValues"] = len(final_unique)
 
         # Coleta valores (ativado ou passivo)
         try:
