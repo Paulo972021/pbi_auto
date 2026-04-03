@@ -2537,6 +2537,126 @@ def cdp_dict_event(event_type: str, x: int, y: int) -> dict:
         }
     }
 
+
+def cdp_dict_key_event(event_type: str, key_payload: dict) -> dict:
+    """
+    Monta evento de teclado via dicionário raw para Input.dispatchKeyEvent.
+    """
+    params = {"type": event_type}
+    params.update(key_payload or {})
+    return {
+        "method": "Input.dispatchKeyEvent",
+        "params": params,
+    }
+
+
+def _key_payload(key_name: str) -> dict:
+    """
+    Mapeia teclas suportadas para payload CDP.
+    """
+    mapping = {
+        "Enter": {
+            "key": "Enter",
+            "code": "Enter",
+            "text": "\r",
+            "unmodifiedText": "\r",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13,
+        },
+        "ArrowDown": {
+            "key": "ArrowDown",
+            "code": "ArrowDown",
+            "text": "",
+            "unmodifiedText": "",
+            "windowsVirtualKeyCode": 40,
+            "nativeVirtualKeyCode": 40,
+        },
+    }
+    return dict(mapping.get(key_name, {}))
+
+
+async def _cdp_key_event(tab, key_name: str) -> bool:
+    """
+    Envia evento de tecla em sequência keyDown -> (char) -> keyUp.
+    Retorna False se qualquer etapa falhar.
+    """
+    payload = _key_payload(key_name)
+    if not payload:
+        log.info(f"    ❌ [_cdp_key_event] tecla não suportada: {key_name}")
+        return False
+
+    try:
+        # Tentativa 1: API tipada do nodriver (evita erro de payload inválido)
+        await tab.send(uc.cdp.input_.dispatch_key_event(type_="keyDown", **payload))
+        if payload.get("text"):
+            await tab.send(uc.cdp.input_.dispatch_key_event(type_="char", **payload))
+        await tab.send(uc.cdp.input_.dispatch_key_event(type_="keyUp", **payload))
+        return True
+    except Exception as e1:
+        log.info(f"    ⚠️ [_cdp_key_event] API tipada falhou ({key_name}): {e1}")
+
+    try:
+        # Tentativa 2: CDP raw em dict
+        await tab.send(cdp_dict_key_event("keyDown", payload))
+        if payload.get("text"):
+            await tab.send(cdp_dict_key_event("char", payload))
+        await tab.send(cdp_dict_key_event("keyUp", payload))
+        return True
+    except Exception as e2:
+        log.info(f"    ❌ [_cdp_key_event] raw falhou ({key_name}): {e2}")
+        return False
+
+
+async def _simple_keyboard_probe(tab) -> dict:
+    """
+    Valida ENTER e ArrowDown fora do Power BI em um input simples.
+    """
+    result = {"ok": False, "enter_ok": False, "arrow_ok": False}
+    try:
+        await tab.evaluate("""
+            (() => {
+                const id = '__pbi_keyboard_probe__';
+                let wrap = document.getElementById(id);
+                if (!wrap) {
+                    wrap = document.createElement('div');
+                    wrap.id = id;
+                    wrap.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;background:#fff;padding:4px;border:1px solid #999;';
+                    wrap.innerHTML = '<input id="__pbi_keyboard_probe_input__" style="width:180px" value="" />';
+                    document.body.appendChild(wrap);
+                }
+            })()
+        """)
+        await tab.evaluate("document.getElementById('__pbi_keyboard_probe_input__')?.focus()")
+        await asyncio.sleep(0.1)
+
+        enter_ok = await _cdp_key_event(tab, "Enter")
+        await asyncio.sleep(0.1)
+        arrow_ok = await _cdp_key_event(tab, "ArrowDown")
+        await asyncio.sleep(0.1)
+
+        probe_raw = await tab.evaluate("""
+            (() => {
+                const i = document.getElementById('__pbi_keyboard_probe_input__');
+                if (!i) return JSON.stringify({exists:false});
+                return JSON.stringify({
+                    exists: true,
+                    focused: document.activeElement === i,
+                    value: i.value || ''
+                });
+            })()
+        """)
+        probe_data = json.loads(str(probe_raw)) if probe_raw else {}
+        result = {
+            "ok": bool(probe_data.get("exists")),
+            "enter_ok": bool(enter_ok),
+            "arrow_ok": bool(arrow_ok),
+            "focused": probe_data.get("focused"),
+            "value": probe_data.get("value"),
+        }
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
 async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
     """
     Executa os 4 experimentos do documento de orientação para descobrir
@@ -2924,6 +3044,32 @@ async def scan_slicers(tab):
         'apply changes', 'aplicar alterações', '(ainda não aplicado)',
     }
 
+    keyboard_probe_done = False
+
+    async def _slicer_focus_snapshot(idx_snap: int) -> dict:
+        try:
+            snap_raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx_snap}];
+                    if (!vc) return JSON.stringify({{error:'no_vc'}});
+                    const ae = document.activeElement;
+                    const visible = Array.from(vc.querySelectorAll(
+                        '.slicerItemContainer, div.row, [class*="slicerItem"]'
+                    )).filter(e => e.getBoundingClientRect().height > 0);
+                    const values = visible.map(e => (e.textContent || '').trim()).filter(Boolean);
+                    const aeDesc = ae ? `${{ae.tagName}}#${{ae.id||''}}.${{String(ae.className||'').split(' ').slice(0,2).join('.')}}` : 'null';
+                    return JSON.stringify({{
+                        activeElement: aeDesc,
+                        in_slicer: !!(vc && ae && vc.contains(ae)),
+                        visible_items: visible.length,
+                        values: [...new Set(values)].slice(0, 40)
+                    }});
+                }})()
+            """)
+            return _j.loads(str(snap_raw)) if snap_raw else {}
+        except Exception as se:
+            return {"error": str(se)}
+
     for slicer in slicers:
         idx        = slicer["index"]
         title      = slicer.get("title", f"Slicer #{idx}")
@@ -3155,6 +3301,78 @@ async def scan_slicers(tab):
                     pass
         else:
             log.info(f"    ⚠️ Nenhuma tentativa ativou o visual — coletando DOM passivo")
+
+        # Validação de teclado fora do Power BI (uma vez por execução)
+        if not keyboard_probe_done:
+            probe = await _simple_keyboard_probe(tab)
+            log.info(
+                f"    [KEYBOARD_PROBE] ok={probe.get('ok')} "
+                f"enter_ok={probe.get('enter_ok')} arrow_ok={probe.get('arrow_ok')} "
+                f"focused={probe.get('focused')}"
+            )
+            if probe.get("error"):
+                log.info(f"    [KEYBOARD_PROBE] error={probe.get('error')}")
+            keyboard_probe_done = True
+
+        # Fluxo de teclado no slicer: ENTER -> ArrowDown (somente se ENTER funcionar)
+        enter_success = False
+        if winner:
+            pre_enter = await _slicer_focus_snapshot(idx)
+            if not pre_enter.get("in_slicer"):
+                if winner_coords:
+                    await _cdp_click(tab, winner_coords.get("x", 0), winner_coords.get("y", 0))
+                    await asyncio.sleep(0.2)
+                pre_enter = await _slicer_focus_snapshot(idx)
+
+            enter_ok = await _cdp_key_event(tab, "Enter")
+            await asyncio.sleep(0.35)
+            post_enter = await _slicer_focus_snapshot(idx)
+            focus_lost_enter = bool(pre_enter.get("in_slicer")) and not bool(post_enter.get("in_slicer"))
+
+            log.info("    [ENTER]")
+            log.info(f"    cdp_ok={enter_ok}")
+            log.info(f"    activeElement_before={pre_enter.get('activeElement')}")
+            log.info(f"    activeElement_after={post_enter.get('activeElement')}")
+            log.info(f"    in_slicer_before={pre_enter.get('in_slicer')}")
+            log.info(f"    in_slicer_after={post_enter.get('in_slicer')}")
+            log.info(f"    focus_lost={focus_lost_enter}")
+
+            # Enter é considerado funcional quando CDP foi OK e o foco permanece no slicer.
+            enter_success = bool(enter_ok and post_enter.get("in_slicer") and not focus_lost_enter)
+            if not enter_success:
+                log.info("    ❌ ENTER falhou; ArrowDown bloqueado para este slicer.")
+
+        if winner and enter_success:
+            discovered_values = set()
+            for step in range(1, 4):
+                before_arrow = await _slicer_focus_snapshot(idx)
+                if not before_arrow.get("in_slicer"):
+                    if winner_coords:
+                        await _cdp_click(tab, winner_coords.get("x", 0), winner_coords.get("y", 0))
+                        await asyncio.sleep(0.2)
+                    before_arrow = await _slicer_focus_snapshot(idx)
+
+                arrow_ok = await _cdp_key_event(tab, "ArrowDown")
+                await asyncio.sleep(0.3)
+                after_arrow = await _slicer_focus_snapshot(idx)
+                focus_lost_arrow = bool(before_arrow.get("in_slicer")) and not bool(after_arrow.get("in_slicer"))
+
+                before_vals = set(before_arrow.get("values") or [])
+                after_vals = set(after_arrow.get("values") or [])
+                new_vals = sorted(v for v in (after_vals - before_vals) if v)
+                discovered_values.update(new_vals)
+
+                log.info("    [ARROWDOWN]")
+                log.info(f"    cdp_ok={arrow_ok}")
+                log.info(f"    step={step}")
+                log.info(f"    focus_lost={focus_lost_arrow}")
+                log.info(f"    visible_items_before={before_arrow.get('visible_items')}")
+                log.info(f"    visible_items_after={after_arrow.get('visible_items')}")
+                log.info(f"    new_values_detected={new_vals}")
+
+                if not arrow_ok or focus_lost_arrow:
+                    log.info("    ⚠️ ArrowDown interrompido por falha de CDP/foco.")
+                    break
 
         # Coleta valores (ativado ou passivo)
         try:
