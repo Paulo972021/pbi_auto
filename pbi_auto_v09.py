@@ -2559,52 +2559,107 @@ def _key_payload(key_name: str) -> dict:
             "key": "Enter",
             "code": "Enter",
             "text": "\r",
-            "unmodifiedText": "\r",
-            "windowsVirtualKeyCode": 13,
-            "nativeVirtualKeyCode": 13,
+            "unmodified_text": "\r",
+            "windows_virtual_key_code": 13,
+            "native_virtual_key_code": 13,
         },
         "ArrowDown": {
             "key": "ArrowDown",
             "code": "ArrowDown",
             "text": "",
-            "unmodifiedText": "",
-            "windowsVirtualKeyCode": 40,
-            "nativeVirtualKeyCode": 40,
+            "unmodified_text": "",
+            "windows_virtual_key_code": 40,
+            "native_virtual_key_code": 40,
         },
     }
     return dict(mapping.get(key_name, {}))
 
 
-async def _cdp_key_event(tab, key_name: str) -> bool:
+def _key_payload_raw_from_typed(typed_payload: dict) -> dict:
+    """
+    Converte payload snake_case (API tipada) para camelCase (CDP raw).
+    """
+    return {
+        "key": typed_payload.get("key", ""),
+        "code": typed_payload.get("code", ""),
+        "text": typed_payload.get("text", ""),
+        "unmodifiedText": typed_payload.get("unmodified_text", ""),
+        "windowsVirtualKeyCode": typed_payload.get("windows_virtual_key_code", 0),
+        "nativeVirtualKeyCode": typed_payload.get("native_virtual_key_code", 0),
+    }
+
+
+async def _send_raw_cdp(tab, method: str, params: dict) -> bool:
+    """
+    Tenta enviar comando CDP raw por caminhos compatíveis com versões distintas.
+    """
+    msg = {"method": method, "params": params or {}}
+    attempts = []
+
+    # Caminhos conhecidos/possíveis de envio
+    if hasattr(tab, "send"):
+        attempts.append(("tab.send(dict)", tab.send, msg))
+
+    conn = getattr(tab, "connection", None) or getattr(tab, "_connection", None)
+    if conn and hasattr(conn, "send"):
+        attempts.append(("tab.connection.send", conn.send, method, params))
+
+    browser = getattr(tab, "browser", None)
+    bconn = getattr(browser, "connection", None) if browser else None
+    if bconn and hasattr(bconn, "send"):
+        attempts.append(("browser.connection.send", bconn.send, method, params))
+
+    for item in attempts:
+        try:
+            fn = item[1]
+            args = item[2:]
+            out = fn(*args)
+            if asyncio.iscoroutine(out):
+                await out
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _cdp_key_event(tab, key_name: str) -> dict:
     """
     Envia evento de tecla em sequência keyDown -> (char) -> keyUp.
-    Retorna False se qualquer etapa falhar.
+    Retorna diagnóstico completo da tentativa de envio da tecla.
     """
     payload = _key_payload(key_name)
     if not payload:
         log.info(f"    ❌ [_cdp_key_event] tecla não suportada: {key_name}")
-        return False
+        return {"cdp_ok": False, "typed_api_ok": False, "raw_api_ok": False}
 
+    typed_ok = False
     try:
-        # Tentativa 1: API tipada do nodriver (evita erro de payload inválido)
+        # Tentativa 1: API tipada do nodriver (snake_case)
         await tab.send(uc.cdp.input_.dispatch_key_event(type_="keyDown", **payload))
         if payload.get("text"):
             await tab.send(uc.cdp.input_.dispatch_key_event(type_="char", **payload))
         await tab.send(uc.cdp.input_.dispatch_key_event(type_="keyUp", **payload))
-        return True
+        typed_ok = True
     except Exception as e1:
         log.info(f"    ⚠️ [_cdp_key_event] API tipada falhou ({key_name}): {e1}")
 
+    raw_ok = False
+    raw_payload = _key_payload_raw_from_typed(payload)
     try:
-        # Tentativa 2: CDP raw em dict
-        await tab.send(cdp_dict_key_event("keyDown", payload))
-        if payload.get("text"):
-            await tab.send(cdp_dict_key_event("char", payload))
-        await tab.send(cdp_dict_key_event("keyUp", payload))
-        return True
+        down_ok = await _send_raw_cdp(tab, "Input.dispatchKeyEvent", {"type": "keyDown", **raw_payload})
+        char_ok = True
+        if raw_payload.get("text"):
+            char_ok = await _send_raw_cdp(tab, "Input.dispatchKeyEvent", {"type": "char", **raw_payload})
+        up_ok = await _send_raw_cdp(tab, "Input.dispatchKeyEvent", {"type": "keyUp", **raw_payload})
+        raw_ok = bool(down_ok and char_ok and up_ok)
     except Exception as e2:
         log.info(f"    ❌ [_cdp_key_event] raw falhou ({key_name}): {e2}")
-        return False
+
+    return {
+        "cdp_ok": bool(typed_ok or raw_ok),
+        "typed_api_ok": bool(typed_ok),
+        "raw_api_ok": bool(raw_ok),
+    }
 
 
 async def _simple_keyboard_probe(tab) -> dict:
@@ -2629,9 +2684,9 @@ async def _simple_keyboard_probe(tab) -> dict:
         await tab.evaluate("document.getElementById('__pbi_keyboard_probe_input__')?.focus()")
         await asyncio.sleep(0.1)
 
-        enter_ok = await _cdp_key_event(tab, "Enter")
+        enter_diag = await _cdp_key_event(tab, "Enter")
         await asyncio.sleep(0.1)
-        arrow_ok = await _cdp_key_event(tab, "ArrowDown")
+        arrow_diag = await _cdp_key_event(tab, "ArrowDown")
         await asyncio.sleep(0.1)
 
         probe_raw = await tab.evaluate("""
@@ -2648,8 +2703,12 @@ async def _simple_keyboard_probe(tab) -> dict:
         probe_data = json.loads(str(probe_raw)) if probe_raw else {}
         result = {
             "ok": bool(probe_data.get("exists")),
-            "enter_ok": bool(enter_ok),
-            "arrow_ok": bool(arrow_ok),
+            "enter_ok": bool((enter_diag or {}).get("cdp_ok")),
+            "arrow_ok": bool((arrow_diag or {}).get("cdp_ok")),
+            "enter_typed_api_ok": bool((enter_diag or {}).get("typed_api_ok")),
+            "enter_raw_api_ok": bool((enter_diag or {}).get("raw_api_ok")),
+            "arrow_typed_api_ok": bool((arrow_diag or {}).get("typed_api_ok")),
+            "arrow_raw_api_ok": bool((arrow_diag or {}).get("raw_api_ok")),
             "focused": probe_data.get("focused"),
             "value": probe_data.get("value"),
         }
@@ -3062,7 +3121,11 @@ async def scan_slicers(tab):
                         activeElement: aeDesc,
                         in_slicer: !!(vc && ae && vc.contains(ae)),
                         visible_items: visible.length,
-                        values: [...new Set(values)].slice(0, 40)
+                        values: [...new Set(values)].slice(0, 60),
+                        explore_mode: !!(
+                            vc.querySelector('[role="listbox"], [role="option"], [aria-expanded="true"]') ||
+                            (ae && (ae.tagName === 'INPUT' || ae.getAttribute('role') === 'listbox'))
+                        )
                     }});
                 }})()
             """)
@@ -3276,6 +3339,9 @@ async def scan_slicers(tab):
 
         if winner:
             winner_coords = exp["winner_coords"]
+            if exp.get("evidence", {}).get("B", {}).get("activated"):
+                winner = "B"
+                winner_coords = (exp.get("evidence", {}).get("B", {}) or {}).get("coords") or winner_coords
             log.info(f"    ✅ Visual ativado via tentativa {winner} — coletando valores...")
             await asyncio.sleep(0.5)
 
@@ -3308,7 +3374,9 @@ async def scan_slicers(tab):
             log.info(
                 f"    [KEYBOARD_PROBE] ok={probe.get('ok')} "
                 f"enter_ok={probe.get('enter_ok')} arrow_ok={probe.get('arrow_ok')} "
-                f"focused={probe.get('focused')}"
+                f"focused={probe.get('focused')} "
+                f"enter_typed={probe.get('enter_typed_api_ok')} enter_raw={probe.get('enter_raw_api_ok')} "
+                f"arrow_typed={probe.get('arrow_typed_api_ok')} arrow_raw={probe.get('arrow_raw_api_ok')}"
             )
             if probe.get("error"):
                 log.info(f"    [KEYBOARD_PROBE] error={probe.get('error')}")
@@ -3318,33 +3386,53 @@ async def scan_slicers(tab):
         enter_success = False
         if winner:
             pre_enter = await _slicer_focus_snapshot(idx)
+            click_before = dict(pre_enter)
             if not pre_enter.get("in_slicer"):
                 if winner_coords:
                     await _cdp_click(tab, winner_coords.get("x", 0), winner_coords.get("y", 0))
                     await asyncio.sleep(0.2)
                 pre_enter = await _slicer_focus_snapshot(idx)
+            click_after = dict(pre_enter)
 
-            enter_ok = await _cdp_key_event(tab, "Enter")
+            log.info("    [CLICK_ACTIVATION]")
+            log.info(f"    slicer={title}")
+            log.info("    target=B")
+            log.info(f"    cdp_click={bool(winner_coords)}")
+            log.info(f"    activeElement_before={click_before.get('activeElement')}")
+            log.info(f"    activeElement_after={click_after.get('activeElement')}")
+            log.info(f"    in_slicer_before={click_before.get('in_slicer')}")
+            log.info(f"    in_slicer_after={click_after.get('in_slicer')}")
+
+            enter_diag = await _cdp_key_event(tab, "Enter")
             await asyncio.sleep(0.35)
             post_enter = await _slicer_focus_snapshot(idx)
-            focus_lost_enter = bool(pre_enter.get("in_slicer")) and not bool(post_enter.get("in_slicer"))
 
             log.info("    [ENTER]")
-            log.info(f"    cdp_ok={enter_ok}")
+            log.info(f"    slicer={title}")
+            log.info(f"    cdp_ok={(enter_diag or {}).get('cdp_ok')}")
+            log.info(f"    typed_api_ok={(enter_diag or {}).get('typed_api_ok')}")
+            log.info(f"    raw_api_ok={(enter_diag or {}).get('raw_api_ok')}")
             log.info(f"    activeElement_before={pre_enter.get('activeElement')}")
             log.info(f"    activeElement_after={post_enter.get('activeElement')}")
             log.info(f"    in_slicer_before={pre_enter.get('in_slicer')}")
             log.info(f"    in_slicer_after={post_enter.get('in_slicer')}")
-            log.info(f"    focus_lost={focus_lost_enter}")
+            log.info(f"    explore_mode_before={pre_enter.get('explore_mode')}")
+            log.info(f"    explore_mode_after={post_enter.get('explore_mode')}")
 
             # Enter é considerado funcional quando CDP foi OK e o foco permanece no slicer.
-            enter_success = bool(enter_ok and post_enter.get("in_slicer") and not focus_lost_enter)
+            enter_success = bool(
+                (enter_diag or {}).get("cdp_ok")
+                and post_enter.get("in_slicer")
+                and (post_enter.get("explore_mode") or post_enter.get("visible_items", 0) >= pre_enter.get("visible_items", 0))
+            )
             if not enter_success:
                 log.info("    ❌ ENTER falhou; ArrowDown bloqueado para este slicer.")
 
         if winner and enter_success:
-            discovered_values = set()
-            for step in range(1, 4):
+            discovered_values = set(slicer.get("allValues") or [])
+            no_change_rounds = 0
+            steps_done = 0
+            for step in range(1, 10):
                 before_arrow = await _slicer_focus_snapshot(idx)
                 if not before_arrow.get("in_slicer"):
                     if winner_coords:
@@ -3352,10 +3440,10 @@ async def scan_slicers(tab):
                         await asyncio.sleep(0.2)
                     before_arrow = await _slicer_focus_snapshot(idx)
 
-                arrow_ok = await _cdp_key_event(tab, "ArrowDown")
+                arrow_diag = await _cdp_key_event(tab, "ArrowDown")
                 await asyncio.sleep(0.3)
                 after_arrow = await _slicer_focus_snapshot(idx)
-                focus_lost_arrow = bool(before_arrow.get("in_slicer")) and not bool(after_arrow.get("in_slicer"))
+                steps_done = step
 
                 before_vals = set(before_arrow.get("values") or [])
                 after_vals = set(after_arrow.get("values") or [])
@@ -3363,16 +3451,37 @@ async def scan_slicers(tab):
                 discovered_values.update(new_vals)
 
                 log.info("    [ARROWDOWN]")
-                log.info(f"    cdp_ok={arrow_ok}")
+                log.info(f"    slicer={title}")
+                log.info(f"    cdp_ok={(arrow_diag or {}).get('cdp_ok')}")
                 log.info(f"    step={step}")
-                log.info(f"    focus_lost={focus_lost_arrow}")
+                log.info(f"    activeElement={after_arrow.get('activeElement')}")
+                log.info(f"    in_slicer={after_arrow.get('in_slicer')}")
+                log.info(f"    explore_mode={after_arrow.get('explore_mode')}")
                 log.info(f"    visible_items_before={before_arrow.get('visible_items')}")
                 log.info(f"    visible_items_after={after_arrow.get('visible_items')}")
                 log.info(f"    new_values_detected={new_vals}")
+                log.info(f"    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
 
-                if not arrow_ok or focus_lost_arrow:
-                    log.info("    ⚠️ ArrowDown interrompido por falha de CDP/foco.")
+                if not (arrow_diag or {}).get("cdp_ok"):
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=cdp_arrow_failed\n    steps={steps_done}\n    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
                     break
+                if not after_arrow.get("in_slicer"):
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=focus_left_slicer\n    steps={steps_done}\n    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
+                    break
+                if new_vals:
+                    no_change_rounds = 0
+                else:
+                    no_change_rounds += 1
+                if no_change_rounds >= 3:
+                    log.info(f"    [ENUM_STOP]\n    slicer={title}\n    reason=no_new_values_3_rounds\n    steps={steps_done}\n    all_unique_values={sorted([v for v in discovered_values if v])[:80]}")
+                    break
+
+            final_unique = sorted([v for v in discovered_values if v])
+            passive_initial = sorted([v for v in (slicer.get("allValues") or []) if v])
+            log.info(
+                f"    [VALUES_COMPARE] slicer={title} passive_count={len(passive_initial)} "
+                f"final_count={len(final_unique)} new_values_revealed={len(final_unique) > len(passive_initial)}"
+            )
 
         # Coleta valores (ativado ou passivo)
         try:
