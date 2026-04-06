@@ -287,15 +287,50 @@ async def get_page_focus_state(tab, stage_label: str = "") -> dict:
         })()
     """
     try:
-        state = await tab.evaluate(script) or {}
+        raw_state = await tab.evaluate(script)
     except Exception as e:
-        state = {"error": str(e)}
+        raw_state = {
+            "ok": False,
+            "hidden": None,
+            "visibilityState": None,
+            "hasFocus": None,
+            "stage": stage_label or "unknown",
+            "error": str(e),
+        }
+
+    if not isinstance(raw_state, dict):
+        log.warning("[FOCUS_STATE_CONTRACT_ERROR]")
+        log.warning(f"  stage={stage_label or 'unknown'}")
+        log.warning(f"  returned_type={type(raw_state).__name__}")
+        log.warning("  fallback_dict_created=True")
+        raw_state = {
+            "ok": False,
+            "hidden": None,
+            "visibilityState": None,
+            "hasFocus": None,
+            "stage": stage_label or "unknown",
+            "error": f"invalid_focus_state_type:{type(raw_state).__name__}",
+        }
+
+    state = {
+        "ok": bool(
+            raw_state.get("hidden") is False
+            and str(raw_state.get("visibilityState") or "").lower() == "visible"
+            and bool(raw_state.get("hasFocus"))
+        ),
+        "hidden": raw_state.get("hidden"),
+        "visibilityState": raw_state.get("visibilityState"),
+        "hasFocus": raw_state.get("hasFocus"),
+        "stage": stage_label or "unknown",
+        "error": raw_state.get("error"),
+    }
 
     log.info("[PAGE_FOCUS_STATE]")
-    log.info(f"  stage={stage_label or 'unknown'}")
+    log.info(f"  stage={state['stage']}")
     log.info(f"  hidden={state.get('hidden')}")
     log.info(f"  visibilityState={state.get('visibilityState')}")
     log.info(f"  hasFocus={state.get('hasFocus')}")
+    log.info(f"  ok={state.get('ok')}")
     return state
 
 
@@ -352,9 +387,38 @@ async def install_focus_visibility_emulation(tab) -> dict:
         })()
     """
     try:
-        patched = await tab.evaluate(script) or {}
+        patched_raw = await tab.evaluate(script)
     except Exception as e:
-        patched = {"ok": False, "error": str(e)}
+        patched_raw = {"ok": False, "error": str(e)}
+
+    if not isinstance(patched_raw, dict):
+        patched = {
+            "ok": False,
+            "hidden": None,
+            "visibilityState": None,
+            "hasFocus": None,
+            "stage": "install_focus_visibility_emulation",
+            "error": f"invalid_focus_install_type:{type(patched_raw).__name__}",
+            "patched_hidden": False,
+            "patched_visibility_state": False,
+            "patched_has_focus": False,
+        }
+        log.warning("[FOCUS_STATE_CONTRACT_ERROR]")
+        log.warning("  stage=install_focus_visibility_emulation")
+        log.warning(f"  returned_type={type(patched_raw).__name__}")
+        log.warning("  fallback_dict_created=True")
+    else:
+        patched = {
+            "ok": bool(patched_raw.get("ok", False)),
+            "hidden": None,
+            "visibilityState": None,
+            "hasFocus": None,
+            "stage": "install_focus_visibility_emulation",
+            "error": patched_raw.get("error"),
+            "patched_hidden": bool(patched_raw.get("patched_hidden", False)),
+            "patched_visibility_state": bool(patched_raw.get("patched_visibility_state", False)),
+            "patched_has_focus": bool(patched_raw.get("patched_has_focus", False)),
+        }
 
     log.info("[FOCUS_EMULATION_INSTALL]")
     log.info(f"  ok={patched.get('ok', False)}")
@@ -369,6 +433,20 @@ async def ensure_focus_visibility_emulation(tab, stage_label: str) -> bool:
     Verifica estado de foco/visibilidade e reaplica emulação quando necessário.
     """
     state_before = await get_page_focus_state(tab, stage_label=f"{stage_label}:before")
+    if not isinstance(state_before, dict):
+        log.warning("[FOCUS_STATE_CONTRACT_ERROR]")
+        log.warning(f"  stage={stage_label}:before")
+        log.warning(f"  returned_type={type(state_before).__name__}")
+        log.warning("  fallback_dict_created=True")
+        state_before = {
+            "ok": False,
+            "hidden": None,
+            "visibilityState": None,
+            "hasFocus": None,
+            "stage": f"{stage_label}:before",
+            "error": f"invalid_focus_state_type:{type(state_before).__name__}",
+        }
+
     hidden = state_before.get("hidden")
     visibility_state = str(state_before.get("visibilityState") or "").lower()
     has_focus = bool(state_before.get("hasFocus"))
