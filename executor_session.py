@@ -274,6 +274,11 @@ async def _run_single_template_in_session(
 
             if norm_title == "epn_final":
                 target_value = target_values[0] if target_values else None
+                value_exists_in_enum = bool(
+                    target_value
+                    and str(target_value).lower() in {str(v).lower() for v in available_values}
+                )
+                selected_immediate = s.get("selectedValues") or []
                 log.info("[FILTER_TRACE_START]")
                 log.info(f"  template_id={tid}")
                 log.info("  filter=epn_final")
@@ -282,14 +287,16 @@ async def _run_single_template_in_session(
                 log.info(f"  template_id={tid}")
                 log.info("  filter=epn_final")
                 log.info(f"  available_values={available_values}")
+                log.info(f"  value_exists_in_enum={value_exists_in_enum}")
                 log.info(f"  selected_before={selected_before}")
                 log.info("[FILTER_TRACE_APPLY]")
                 log.info(f"  template_id={tid}")
                 log.info("  filter=epn_final")
                 log.info(f"  target_value={target_value}")
                 log.info("  action=scan_slicers_apply_runtime_plan")
-                log.info("  click_done=unknown")
-                log.info(f"  selected_after_click={s.get('selectedValues') or []}")
+                log.info(f"  locator_found={value_exists_in_enum}")
+                log.info(f"  click_done={str(target_value).lower() in {str(v).lower() for v in selected_immediate}}")
+                log.info(f"  selected_immediately_after_click={selected_immediate}")
 
             if target_set.issubset(selected_set):
                 filters_ok.append(norm_title)
@@ -306,9 +313,9 @@ async def _run_single_template_in_session(
                 if target_values and not set(v.lower() for v in target_values).intersection(
                     set(v.lower() for v in available_values)
                 ):
-                    reason = "value_not_found"
+                    reason = "value_not_found_in_enum"
                 elif not (s.get("selectedValues") or []):
-                    reason = "selection_readback_failed"
+                    reason = "readback_failed"
                 failure_details.append(
                     {
                         "filter": norm_title,
@@ -344,6 +351,25 @@ async def _run_single_template_in_session(
         await asyncio.sleep(0.5)
         await pbi.cleanup_residual_ui(tab, stage_label="post_filter", aggressive=True)
         await asyncio.sleep(3)  # render wait
+
+        # Recheck defensivo para isolar persistência de seleção (foco no tpl_002/epn_final)
+        if "epn_final" in runtime_plan:
+            recheck_selected = []
+            try:
+                slicers_recheck = await pbi.scan_slicers(tab)
+                epn_recheck = next(
+                    (s for s in slicers_recheck if pbi.normalize_slicer_name(s.get("title", "")) == "epn_final"),
+                    None,
+                )
+                recheck_selected = (epn_recheck or {}).get("selectedValues") or []
+            except Exception:
+                recheck_selected = []
+
+            log.info("[FILTER_TRACE_RECHECK]")
+            log.info(f"  template_id={tid}")
+            log.info("  filter=epn_final")
+            log.info(f"  target_value={(runtime_plan.get('epn_final') or {}).get('target_values', [None])[0]}")
+            log.info(f"  selected_after_reopen_or_refresh={recheck_selected}")
 
         if critical_incidents:
             log.warning(f"  [POST_FILTER_GATE] critical_incidents={critical_incidents}")
