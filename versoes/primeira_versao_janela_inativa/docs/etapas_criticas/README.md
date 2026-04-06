@@ -21,9 +21,9 @@ Esta pasta documenta as funções críticas pedidas:
 6. [`06_apply_filter_plan.md`](./06_apply_filter_plan.md)
 7. [`07_apply_filter_safe_control.md`](./07_apply_filter_safe_control.md)
 8. [`08_run_export.md`](./08_run_export.md)
+9. [`09_fluxos_detalhados_funcoes_criticas.md`](./09_fluxos_detalhados_funcoes_criticas.md)
 
 ## Observação importante sobre chamada
 
 - `apply_filter_safe_control` **está definida**, mas não possui chamada ativa neste snapshot.
 - O fluxo efetivo de filtros passa por `scan_slicers -> apply_filter_plan`.
-

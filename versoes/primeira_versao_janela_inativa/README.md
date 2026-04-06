@@ -162,6 +162,7 @@ Objetivo: facilitar onboarding e manutenção sem alterar comportamento.
 - `docs/microfluxos.md`: subprocessos detalhados.
 - `docs/legenda_navegacao.md`: convenção visual e padrão de comentários.
 - `docs/etapas_criticas/`: detalhamento focado das funções críticas de slicers/filtros e `run_export`.
+  - inclui `09_fluxos_detalhados_funcoes_criticas.md` com fluxos passo a passo das funções críticas.
 
 ---
 
