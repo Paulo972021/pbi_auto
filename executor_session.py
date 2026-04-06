@@ -32,6 +32,7 @@ from executor_real import (
     _detect_new_files,
     _wait_for_downloads_complete,
     _move_files_to_output,
+    _clean_downloads_before_template,
     _DOWNLOAD_SETTLE_WAIT,
 )
 
@@ -165,7 +166,7 @@ async def _template_transition_cleanup(
 # ---------------------------------------------------------------------------
 
 async def _run_single_template_in_session(
-    tab, pbi, template: dict, catalog: dict,
+    tab, pbi, template: dict, catalog: dict, transition_clean: bool = True,
 ) -> dict:
     """
     Executa um template usando tab/browser já abertos.
@@ -176,6 +177,14 @@ async def _run_single_template_in_session(
     tid = template.get("template_id", "unknown")
     page = template.get("page", "")
     template_code = generate_template_code(template)
+    output_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+    output_folder_raw = os.path.join(output_root, template_code)
+    previous_output_contents = []
+    if os.path.isdir(output_folder_raw):
+        try:
+            previous_output_contents = sorted(os.listdir(output_folder_raw))
+        except Exception:
+            previous_output_contents = []
     output_folder = prepare_output_folder(template_code)
     runtime_plan = build_runtime_filter_plan_from_template(template)
 
@@ -198,12 +207,18 @@ async def _run_single_template_in_session(
     log.info(f"  template_code={template_code}")
     log.info(f"  output_folder={output_folder}")
     log.info(f"  filter_plan={list(runtime_plan.keys())}")
+    log.info("[OUTPUT_FOLDER_PREPARE]")
+    log.info(f"  template_id={tid}")
+    log.info(f"  output_folder={output_folder}")
+    log.info("  folder_recreated=True")
+    log.info(f"  previous_contents_removed={bool(previous_output_contents)}")
 
     # ── Configurar FILTER_PLAN no módulo ──
     original_plan = getattr(pbi, "FILTER_PLAN", {})
     pbi.FILTER_PLAN = runtime_plan
 
     downloads_folder = _get_downloads_folder()
+    _clean_downloads_before_template(downloads_folder, tid)
     before_files = _snapshot_downloads(downloads_folder)
 
     try:
@@ -228,23 +243,97 @@ async def _run_single_template_in_session(
         slicers = await pbi.scan_slicers(tab)
         pbi._display_slicers_inline(slicers)
 
+        epn_slicer = next(
+            (s for s in slicers if pbi.normalize_slicer_name(s.get("title", "")) == "epn_final"),
+            None,
+        )
+        selected_before = (epn_slicer or {}).get("selectedValues") or []
+        log.info("[FILTER_PRECONDITION]")
+        log.info(f"  template_id={tid}")
+        log.info("  filter=epn_final")
+        log.info(f"  selected_before={selected_before}")
+        log.info(f"  ui_clean={bool(transition_clean)}")
+        log.info(f"  template_transition_clean={bool(transition_clean)}")
+
         # ── POST-FILTER GATE ──
         filters_expected = list(runtime_plan.keys())
         filters_ok = []
         filters_failed = []
         critical_incidents = []
+        failure_details = []
 
         for s in slicers:
             norm_title = pbi.normalize_slicer_name(s.get("title", ""))
             if norm_title not in runtime_plan:
                 continue
             plan_cfg = runtime_plan[norm_title]
+            target_values = plan_cfg.get("target_values", [])
             target_set = {v.lower() for v in plan_cfg.get("target_values", [])}
             selected_set = {v.lower() for v in (s.get("selectedValues") or [])}
+            available_values = s.get("allValues") or []
+
+            if norm_title == "epn_final":
+                target_value = target_values[0] if target_values else None
+                log.info("[FILTER_TRACE_START]")
+                log.info(f"  template_id={tid}")
+                log.info("  filter=epn_final")
+                log.info(f"  target_value={target_value}")
+                log.info("[FILTER_TRACE_ENUM]")
+                log.info(f"  template_id={tid}")
+                log.info("  filter=epn_final")
+                log.info(f"  available_values={available_values}")
+                log.info(f"  selected_before={selected_before}")
+                log.info("[FILTER_TRACE_APPLY]")
+                log.info(f"  template_id={tid}")
+                log.info("  filter=epn_final")
+                log.info(f"  target_value={target_value}")
+                log.info("  action=scan_slicers_apply_runtime_plan")
+                log.info("  click_done=unknown")
+                log.info(f"  selected_after_click={s.get('selectedValues') or []}")
+
             if target_set.issubset(selected_set):
                 filters_ok.append(norm_title)
+                if norm_title == "epn_final":
+                    log.info("[FILTER_TRACE_VALIDATE]")
+                    log.info(f"  template_id={tid}")
+                    log.info("  filter=epn_final")
+                    log.info(f"  target_value={target_values[0] if target_values else None}")
+                    log.info(f"  final_selected={s.get('selectedValues') or []}")
+                    log.info("  validation_ok=True")
             else:
                 filters_failed.append(norm_title)
+                reason = "target_not_selected_after_apply"
+                if target_values and not set(v.lower() for v in target_values).intersection(
+                    set(v.lower() for v in available_values)
+                ):
+                    reason = "value_not_found"
+                elif not (s.get("selectedValues") or []):
+                    reason = "selection_readback_failed"
+                failure_details.append(
+                    {
+                        "filter": norm_title,
+                        "target_value": target_values[0] if target_values else None,
+                        "available_values": available_values,
+                        "selected_values": s.get("selectedValues") or [],
+                        "validation_ok": False,
+                        "reason": reason,
+                    }
+                )
+                log.warning("[FILTER_GATE_DETAIL]")
+                log.warning(f"  template_id={tid}")
+                log.warning(f"  filter={norm_title}")
+                log.warning(f"  target_value={target_values[0] if target_values else None}")
+                log.warning(f"  available_values={available_values}")
+                log.warning(f"  selected_values={s.get('selectedValues') or []}")
+                log.warning("  validation_ok=False")
+                log.warning(f"  reason={reason}")
+                if norm_title == "epn_final":
+                    log.warning("[FILTER_TRACE_VALIDATE]")
+                    log.warning(f"  template_id={tid}")
+                    log.warning("  filter=epn_final")
+                    log.warning(f"  target_value={target_values[0] if target_values else None}")
+                    log.warning(f"  final_selected={s.get('selectedValues') or []}")
+                    log.warning("  validation_ok=False")
                 if plan_cfg.get("required", True):
                     critical_incidents.append(
                         f"required_filter_failed:{norm_title}"
@@ -258,9 +347,25 @@ async def _run_single_template_in_session(
 
         if critical_incidents:
             log.warning(f"  [POST_FILTER_GATE] critical_incidents={critical_incidents}")
+            log.warning("[TEMPLATE_FILTER_SUMMARY]")
+            log.warning(f"  template_id={tid}")
+            log.warning(f"  filters_expected={filters_expected}")
+            log.warning(f"  filters_ok={filters_ok}")
+            log.warning(f"  filters_failed={filters_failed}")
+            for fd in failure_details:
+                log.warning("[TEMPLATE_FILTER_FAILURE_DETAIL]")
+                log.warning(f"  template_id={tid}")
+                log.warning(f"  filter={fd['filter']}")
+                log.warning(f"  target_value={fd['target_value']}")
+                log.warning(f"  reason={fd['reason']}")
             result["error"] = f"filter_gate_failed: {critical_incidents}"
             return result
 
+        log.info("[TEMPLATE_FILTER_SUMMARY]")
+        log.info(f"  template_id={tid}")
+        log.info(f"  filters_expected={filters_expected}")
+        log.info(f"  filters_ok={filters_ok}")
+        log.info(f"  filters_failed={filters_failed}")
         log.info(f"  [POST_FILTER_GATE] filters_ok={filters_ok} export_release=True")
 
         # ── FASE 2: Scan e exportação de visuais ──
@@ -453,6 +558,7 @@ async def run_templates_for_page_in_shared_session(
         # ══════════════════════════════════════════════════════════
 
         previous_tid = None
+        previous_cleanup = {"ui_clean": True, "filters_reset_ok": True, "report_stable": True}
 
         for tpl in templates:
             tid = tpl.get("template_id", "?")
@@ -476,6 +582,7 @@ async def run_templates_for_page_in_shared_session(
                 cleanup = await _template_transition_cleanup(
                     tab, pbi, page, previous_tid, tid
                 )
+                previous_cleanup = cleanup
                 if not cleanup.get("report_stable"):
                     log.warning(f"  ⚠️ Relatório instável após transição, aguardando mais...")
                     await asyncio.sleep(3)
@@ -486,7 +593,13 @@ async def run_templates_for_page_in_shared_session(
                 f"[FOCUS_POLICY] stage=template_{tid} safe_focus_called=False "
                 f"reason=template_execution_dom_path fallback_only=True"
             )
-            tpl_result = await _run_single_template_in_session(tab, pbi, tpl, catalog)
+            tpl_result = await _run_single_template_in_session(
+                tab,
+                pbi,
+                tpl,
+                catalog,
+                transition_clean=bool(previous_cleanup.get("ui_clean") and previous_cleanup.get("report_stable")),
+            )
             results.append(tpl_result)
 
             if tpl_result.get("success"):

@@ -31,6 +31,7 @@ from storage import prepare_output_folder
 log = logging.getLogger("executor_real")
 
 _DOWNLOAD_SETTLE_WAIT = 3.0
+_DOWNLOAD_CLEAN_EXTENSIONS = {".xlsx", ".csv", ".crdownload", ".tmp"}
 
 
 def _get_downloads_folder() -> str:
@@ -83,6 +84,39 @@ def _move_files_to_output(new_files: list, downloads_folder: str, output_folder:
         except Exception:
             continue
     return moved
+
+
+def _clean_downloads_before_template(downloads_folder: str, template_id: str) -> list:
+    """
+    Remove resíduos de exportação da pasta de downloads, de forma controlada.
+    Só remove extensões relevantes ao fluxo de export.
+    """
+    removed = []
+    try:
+        entries = os.listdir(downloads_folder)
+    except Exception:
+        entries = []
+
+    for name in entries:
+        lower_name = name.lower()
+        _, ext = os.path.splitext(lower_name)
+        if ext not in _DOWNLOAD_CLEAN_EXTENSIONS:
+            continue
+        src = os.path.join(downloads_folder, name)
+        if not os.path.isfile(src):
+            continue
+        try:
+            os.remove(src)
+            removed.append(name)
+        except Exception:
+            continue
+
+    log.info("[DOWNLOADS_CLEANUP_BEFORE_TEMPLATE]")
+    log.info(f"  template_id={template_id}")
+    log.info(f"  downloads_folder={downloads_folder}")
+    log.info(f"  files_removed={removed}")
+    log.info(f"  removed_count={len(removed)}")
+    return removed
 
 
 # ---------------------------------------------------------------------------
