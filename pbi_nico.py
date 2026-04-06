@@ -186,7 +186,7 @@ def build_browser_args():
     Argumentos do navegador.
     Mantidos em função separada para facilitar ajustes futuros.
     """
-    return [
+    base_args = [
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--disable-infobars",
@@ -194,6 +194,24 @@ def build_browser_args():
         "--lang=pt-BR",
         "--disable-popup-blocking",
     ]
+    background_safe_args = [
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-features=CalculateNativeWinOcclusion",
+    ]
+
+    merged_args = list(base_args)
+    for flag in background_safe_args:
+        if flag not in merged_args:
+            merged_args.append(flag)
+
+    kept_flags = [f for f in base_args if f in merged_args]
+    added_flags = [f for f in merged_args if f not in base_args]
+    log.info("[BACKGROUND_MODE_FLAGS]")
+    log.info(f"  flags_added={added_flags}")
+    log.info(f"  flags_kept={kept_flags}")
+    return merged_args
 
 
 def _tab_ref(tab):
@@ -245,6 +263,135 @@ async def safe_focus_tab(tab):
     except Exception:
         with contextlib.suppress(Exception):
             await tab.evaluate("window.focus()")
+
+
+async def get_page_focus_state(tab, stage_label: str = "") -> dict:
+    """Coleta o estado atual de foco/visibilidade da página."""
+    script = """
+        (() => {
+            const state = {
+                hidden: null,
+                visibilityState: null,
+                hasFocus: null,
+                webkitHidden: null,
+                onblur_bound: false,
+                onfocus_bound: false,
+            };
+            try { state.hidden = document.hidden; } catch (_) {}
+            try { state.visibilityState = document.visibilityState; } catch (_) {}
+            try { state.hasFocus = document.hasFocus ? document.hasFocus() : null; } catch (_) {}
+            try { state.webkitHidden = document.webkitHidden; } catch (_) {}
+            try { state.onblur_bound = typeof window.onblur === "function"; } catch (_) {}
+            try { state.onfocus_bound = typeof window.onfocus === "function"; } catch (_) {}
+            return state;
+        })()
+    """
+    try:
+        state = await tab.evaluate(script) or {}
+    except Exception as e:
+        state = {"error": str(e)}
+
+    log.info("[PAGE_FOCUS_STATE]")
+    log.info(f"  stage={stage_label or 'unknown'}")
+    log.info(f"  hidden={state.get('hidden')}")
+    log.info(f"  visibilityState={state.get('visibilityState')}")
+    log.info(f"  hasFocus={state.get('hasFocus')}")
+    return state
+
+
+async def install_focus_visibility_emulation(tab) -> dict:
+    """
+    Injeta emulação defensiva/idempotente de foco e visibilidade.
+    """
+    script = """
+        (() => {
+            const result = {
+                ok: false,
+                patched_hidden: false,
+                patched_visibility_state: false,
+                patched_has_focus: false,
+                patched_webkit_hidden: false,
+            };
+            try {
+                const defineSafe = (obj, prop, getterFn) => {
+                    try {
+                        Object.defineProperty(obj, prop, {
+                            get: getterFn,
+                            configurable: true,
+                        });
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+
+                const dProto = Object.getPrototypeOf(document);
+                result.patched_hidden = defineSafe(dProto, "hidden", () => false);
+                result.patched_visibility_state = defineSafe(dProto, "visibilityState", () => "visible");
+                if ("webkitHidden" in document) {
+                    result.patched_webkit_hidden = defineSafe(dProto, "webkitHidden", () => false);
+                } else {
+                    result.patched_webkit_hidden = true;
+                }
+                result.patched_has_focus = defineSafe(dProto, "hasFocus", () => (() => true));
+
+                try { window.dispatchEvent(new Event("focus")); } catch (_) {}
+                try { document.dispatchEvent(new Event("visibilitychange")); } catch (_) {}
+                try { document.dispatchEvent(new Event("focus")); } catch (_) {}
+
+                result.ok = Boolean(
+                    result.patched_hidden &&
+                    result.patched_visibility_state &&
+                    result.patched_has_focus
+                );
+                return result;
+            } catch (err) {
+                result.error = String(err);
+                return result;
+            }
+        })()
+    """
+    try:
+        patched = await tab.evaluate(script) or {}
+    except Exception as e:
+        patched = {"ok": False, "error": str(e)}
+
+    log.info("[FOCUS_EMULATION_INSTALL]")
+    log.info(f"  ok={patched.get('ok', False)}")
+    log.info(f"  patched_hidden={patched.get('patched_hidden', False)}")
+    log.info(f"  patched_visibility_state={patched.get('patched_visibility_state', False)}")
+    log.info(f"  patched_has_focus={patched.get('patched_has_focus', False)}")
+    return patched
+
+
+async def ensure_focus_visibility_emulation(tab, stage_label: str) -> bool:
+    """
+    Verifica estado de foco/visibilidade e reaplica emulação quando necessário.
+    """
+    state_before = await get_page_focus_state(tab, stage_label=f"{stage_label}:before")
+    hidden = state_before.get("hidden")
+    visibility_state = str(state_before.get("visibilityState") or "").lower()
+    has_focus = bool(state_before.get("hasFocus"))
+    ok_before = (hidden is False) and (visibility_state == "visible") and has_focus
+
+    if not ok_before:
+        await install_focus_visibility_emulation(tab)
+        state_after = await get_page_focus_state(tab, stage_label=f"{stage_label}:after_install")
+    else:
+        state_after = state_before
+
+    hidden_after = state_after.get("hidden")
+    visibility_after = str(state_after.get("visibilityState") or "").lower()
+    has_focus_after = bool(state_after.get("hasFocus"))
+    ok = (hidden_after is False) and (visibility_after == "visible") and has_focus_after
+
+    log.info("[FOCUS_EMULATION_CHECK]")
+    log.info(f"  stage={stage_label}")
+    log.info(f"  document_hidden={hidden_after}")
+    log.info(f"  visibility_state={visibility_after}")
+    log.info(f"  has_focus={has_focus_after}")
+    log.info(f"  ok={ok}")
+    return ok
 
 
 async def get_tab_url(tab) -> str:
@@ -6423,7 +6570,23 @@ async def run_export(url: str, browser_path: str, target_page: str, stop_after_f
 
     try:
         tab = await open_report_tab(browser, url, owned_tab_refs)
-        await safe_focus_tab(tab)
+        focus_ok = await ensure_focus_visibility_emulation(tab, stage_label="post_open_tab")
+        log.info("[FOCUS_POLICY]")
+        log.info("  stage=post_open_tab")
+        log.info("  mode=dom_emulation_first")
+        log.info(f"  safe_focus_called={not focus_ok}")
+        log.info("  fallback_only=True")
+        log.info(f"  reason={'emulation_ok' if focus_ok else 'emulation_failed'}")
+        if not focus_ok:
+            log.warning("[FOCUS_FALLBACK_USED]")
+            log.warning("  stage=post_open_tab")
+            log.warning("  reason=focus_emulation_failed")
+            await safe_focus_tab(tab)
+            focus_ok = await ensure_focus_visibility_emulation(tab, stage_label="post_open_tab_after_fallback")
+            if not focus_ok:
+                log.error("❌ Falha ao estabilizar foco/visibilidade após fallback.")
+                return False
+
         await close_extra_tabs_created_by_script(browser, tab, owned_tab_refs)
         await allow_multiple_downloads(tab)
 
@@ -6455,6 +6618,7 @@ async def run_export(url: str, browser_path: str, target_page: str, stop_after_f
             target_loaded = await wait_for_visuals_or_abort(tab, stage_label=f"navegação para TARGET_PAGE='{target_page}'", retries=8, wait_seconds=3, allow_reload=True)
             if not target_loaded:
                 return False
+            await ensure_focus_visibility_emulation(tab, stage_label="post_navigation_target_page")
         else:
             ready_without_target = await wait_for_visuals_or_abort(tab, stage_label="página inicial (sem TARGET_PAGE)", retries=8, wait_seconds=3, allow_reload=True)
             if not ready_without_target:
@@ -6475,6 +6639,14 @@ async def run_export(url: str, browser_path: str, target_page: str, stop_after_f
         print("\n" + "=" * 70)
         print("📌 ETAPA 1 - LEITURA DE FILTROS")
         print("=" * 70)
+
+        pre_filters_ok = await ensure_focus_visibility_emulation(tab, stage_label="pre-filters")
+        log.info("[FOCUS_POLICY]")
+        log.info("  stage=pre-filters")
+        log.info("  mode=dom_emulation_first")
+        log.info("  safe_focus_called=False")
+        log.info("  fallback_only=True")
+        log.info(f"  reason={'emulation_ok' if pre_filters_ok else 'emulation_not_fully_confirmed'}")
 
         await cleanup_residual_ui(tab, stage_label="antes do scan de slicers", aggressive=True)
         slicers = await scan_slicers(tab)
@@ -6596,6 +6768,14 @@ async def run_export(url: str, browser_path: str, target_page: str, stop_after_f
         log.info("======================================================================")
         log.info("📌 Escaneando visuais disponíveis")
         log.info("======================================================================")
+        pre_export_ok = await ensure_focus_visibility_emulation(tab, stage_label="pre-export")
+        log.info("[FOCUS_POLICY]")
+        log.info("  stage=pre-export")
+        log.info("  mode=dom_emulation_first")
+        log.info("  safe_focus_called=False")
+        log.info("  fallback_only=True")
+        log.info(f"  reason={'emulation_ok' if pre_export_ok else 'emulation_not_fully_confirmed'}")
+
         await cleanup_residual_ui(tab, stage_label="antes do scan de visuais", aggressive=True)
         visuals = await scan_visuals(tab)
         display_visuals(visuals)

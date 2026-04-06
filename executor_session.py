@@ -111,6 +111,7 @@ async def _template_transition_cleanup(
 
     # 3. Dismiss popups
     await pbi.dismiss_sensitive_data_popup(tab)
+    await pbi.ensure_focus_visibility_emulation(tab, stage_label=f"post-transition-{from_tid}-to-{to_tid}")
 
     # 4. Esperar render
     await asyncio.sleep(2)
@@ -206,6 +207,12 @@ async def _run_single_template_in_session(
     before_files = _snapshot_downloads(downloads_folder)
 
     try:
+        pre_filters_ok = await pbi.ensure_focus_visibility_emulation(tab, stage_label=f"pre-filters-{tid}")
+        log.info(
+            f"[FOCUS_POLICY] stage=pre-filters-{tid} mode=dom_emulation_first "
+            f"safe_focus_called=False fallback_only=True reason={'emulation_ok' if pre_filters_ok else 'emulation_not_fully_confirmed'}"
+        )
+
         # ── Bloquear links externos ──
         await pbi.block_microsoft_learn_and_external_links(tab)
         await pbi.cleanup_residual_ui(tab, stage_label=f"pre-template {tid}", aggressive=True)
@@ -258,6 +265,11 @@ async def _run_single_template_in_session(
 
         # ── FASE 2: Scan e exportação de visuais ──
         log.info(f"  📌 Escaneando visuais para exportação...")
+        pre_export_ok = await pbi.ensure_focus_visibility_emulation(tab, stage_label=f"pre-export-{tid}")
+        log.info(
+            f"[FOCUS_POLICY] stage=pre-export-{tid} mode=dom_emulation_first "
+            f"safe_focus_called=False fallback_only=True reason={'emulation_ok' if pre_export_ok else 'emulation_not_fully_confirmed'}"
+        )
         slicer_indexes = {s.get("index") for s in slicers}
         visuals = await pbi.scan_visuals(tab, slicer_indexes=slicer_indexes)
 
@@ -373,6 +385,17 @@ async def run_templates_for_page_in_shared_session(
         browser, _profile_dir = await pbi.start_isolated_browser(browser_path_norm)
 
         tab = await pbi.open_report_tab(browser, url, owned_tab_refs)
+        post_open_ok = await pbi.ensure_focus_visibility_emulation(tab, stage_label="post-open-tab-session")
+        log.info(
+            f"[FOCUS_POLICY] stage=post-open-tab-session mode=dom_emulation_first "
+            f"safe_focus_called={not post_open_ok} fallback_only=True "
+            f"reason={'emulation_ok' if post_open_ok else 'emulation_failed'}"
+        )
+        if not post_open_ok:
+            log.warning("[FOCUS_FALLBACK_USED] stage=post-open-tab-session reason=focus_emulation_failed")
+            await pbi.safe_focus_tab(tab)
+            _ = await pbi.ensure_focus_visibility_emulation(tab, stage_label="post-open-tab-session-after-fallback")
+
         await pbi.close_extra_tabs_created_by_script(browser, tab, owned_tab_refs)
         await _run_with_focus_fallback(
             tab,
@@ -421,6 +444,7 @@ async def run_templates_for_page_in_shared_session(
             if not loaded2:
                 return {"page": page, "error": "visuals_not_loaded_after_navigation",
                         "results": [], "success": 0, "failed": len(templates), "skipped": 0}
+            await pbi.ensure_focus_visibility_emulation(tab, stage_label=f"post-navigation-{page}")
 
         await pbi.close_open_menus_and_overlays(tab, aggressive=True)
 
