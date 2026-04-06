@@ -3,6 +3,9 @@
 Teste isolado para enumeração por micro-scroll do slicer `acao_tatica`.
 Não altera fluxo principal do projeto.
 """
+# ============================================================
+# 🧪 TESTE DIAGNÓSTICO: ENUMERAÇÃO POR MICRO-SCROLL
+# ============================================================
 
 import asyncio
 import json
@@ -13,9 +16,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
-# =============================
-# Parâmetros de configuração
-# =============================
+# ============================================================
+# ⚙️ CONFIGURAÇÕES DO TESTE
+# ============================================================
 REPORT_URL = os.environ.get("PBI_REPORT_URL", "")
 TAB_NAME = "COMPARATIVO"
 SLICER_NAME = "acao_tatica"
@@ -57,6 +60,9 @@ class PhaseLogger:
 def normalize_value(text: str) -> str:
     return (text or "").strip()
 
+# ============================================================
+# 🔎 FUNÇÕES DE NAVEGAÇÃO E LEITURA DO SLICER
+# ============================================================
 
 def should_discard(text: str) -> Tuple[bool, str]:
     v = normalize_value(text)

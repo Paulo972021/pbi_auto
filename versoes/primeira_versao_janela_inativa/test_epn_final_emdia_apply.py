@@ -3,6 +3,9 @@
 
 Objetivo: detectar seleção acidental na ativação, validar clear e apply com re-read em múltiplos timings.
 """
+# ============================================================
+# 🧪 TESTE DIAGNÓSTICO: epn_final = EMDIA
+# ============================================================
 
 import asyncio
 import json
@@ -22,6 +25,9 @@ WAIT_SHORT = 0.4
 WAIT_STABILIZE = 1.0
 HEADLESS = False
 
+# ============================================================
+# ⚙️ LOGGING E ESTADO DE LEITURA DO SLICER
+# ============================================================
 
 class TLogger:
     def __init__(self, path: str):
@@ -56,6 +62,9 @@ class SlicerState:
 def _norm(s: Optional[str]) -> str:
     return (s or "").strip().lower()
 
+# ============================================================
+# 🔎 OPERAÇÕES DE UI (ABA/SLICER/CLEAR/APPLY)
+# ============================================================
 
 async def _activate_tab(tab, tab_name: str) -> bool:
     return bool(await tab.evaluate(

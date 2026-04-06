@@ -4,6 +4,9 @@
 Cenário A: alvo no topo (primeiros itens visíveis)
 Cenário B: alvo que exige scroll
 """
+# ============================================================
+# 🧪 TESTE DIAGNÓSTICO: HIPÓTESE DE REGISTRY VS JANELA VISÍVEL
+# ============================================================
 
 import asyncio
 import json
@@ -25,6 +28,9 @@ STALL_THRESHOLD = int(os.environ.get("STALL_THRESHOLD", "5"))
 MAX_DURATION_SEC = int(os.environ.get("MAX_DURATION_SEC", "120"))
 LOG_DIR = "./logs"
 
+# ============================================================
+# ⚙️ LOGGING E INSTRUMENTAÇÃO DE CHAMADAS
+# ============================================================
 
 class L:
     def __init__(self, path: str):
@@ -145,6 +151,9 @@ async def _scroll_once(tab, slicer_name: str, delta: int) -> bool:
 def _norm(v: str) -> str:
     return (v or "").strip().lower()
 
+# ============================================================
+# 🔁 CENÁRIOS DE EXECUÇÃO E CONTROLE DO TESTE
+# ============================================================
 
 async def _run_scenario(tab, log: L, scenario_name: str, target: str) -> Dict[str, Any]:
     found_registry = set()
