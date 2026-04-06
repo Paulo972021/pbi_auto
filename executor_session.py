@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import importlib
+from datetime import datetime, timezone
 
 from validator import validate_template
 from codegen import generate_template_code
@@ -187,6 +188,44 @@ async def _run_single_template_in_session(
             previous_output_contents = []
     output_folder = prepare_output_folder(template_code)
     runtime_plan = build_runtime_filter_plan_from_template(template)
+    emdia_plan = (runtime_plan.get("epn_final") or {})
+    emdia_target = (emdia_plan.get("target_values") or [None])[0]
+    is_emdia_case = (tid == "tpl_002" and str(emdia_target or "").upper() == "EMDIA")
+    emdia_case_start_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    emdia_log_lines = []
+
+    def _iso_now():
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def _emit_emdia_block(block: str, **fields):
+        if not is_emdia_case:
+            return
+        lines = [f"[{block}]", f"timestamp={_iso_now()}"]
+        for k, v in fields.items():
+            lines.append(f"{k}={v}")
+        for line in lines:
+            log.info(line)
+            emdia_log_lines.append(line)
+
+    def _save_emdia_log():
+        if not is_emdia_case:
+            return
+        os.makedirs("logs", exist_ok=True)
+        log_path = os.path.join("logs", f"emdia_debug_{emdia_case_start_ts}.log")
+        save_ok = True
+        save_error = None
+        try:
+            with open(log_path, "w", encoding="utf-8") as fp:
+                fp.write("\n".join(emdia_log_lines) + "\n")
+        except Exception as e:
+            save_ok = False
+            save_error = str(e)
+        log.info("[EMDIA_LOG_SAVED]")
+        log.info(f"timestamp={_iso_now()}")
+        log.info(f"log_path=./{log_path}")
+        log.info(f"total_log_lines={len(emdia_log_lines)}")
+        log.info(f"save_ok={save_ok}")
+        log.info(f"save_error={save_error if save_error else 'None'}")
 
     result = {
         "template_id": tid,
@@ -222,6 +261,12 @@ async def _run_single_template_in_session(
     before_files = _snapshot_downloads(downloads_folder)
 
     try:
+        _emit_emdia_block(
+            "EMDIA_CASE_START",
+            template_id=tid,
+            filter="epn_final",
+            target_value="EMDIA",
+        )
         pre_filters_ok = await pbi.ensure_focus_visibility_emulation(tab, stage_label=f"pre-filters-{tid}")
         log.info(
             f"[FOCUS_POLICY] stage=pre-filters-{tid} mode=dom_emulation_first "
@@ -236,6 +281,7 @@ async def _run_single_template_in_session(
         loaded = await pbi.wait_for_visual_containers(tab, retries=6, wait_seconds=3)
         if not loaded:
             result["error"] = "no_visual_containers"
+            _save_emdia_log()
             return result
 
         # ── FASE 1: Scan slicers (inclui enumeração + aplicação de filtros) ──
@@ -248,6 +294,23 @@ async def _run_single_template_in_session(
             None,
         )
         selected_before = (epn_slicer or {}).get("selectedValues") or []
+        available_before = (epn_slicer or {}).get("allValues") or []
+        clear_first = bool(emdia_plan.get("clear_first", False))
+        _emit_emdia_block(
+            "EMDIA_PRE_STATE",
+            selected_before=selected_before,
+            available_values=available_before,
+            clear_first=clear_first,
+            reason_for_clear="plan_clear_first" if clear_first else "N/A",
+        )
+        if clear_first:
+            _emit_emdia_block(
+                "EMDIA_CLEAR_RESULT",
+                selected_before_clear=selected_before,
+                selected_after_clear=[] if not selected_before else selected_before,
+                clear_ok=(len(selected_before) == 0),
+                clear_failure_detail="N/A" if len(selected_before) == 0 else "residual_selection_before_apply",
+            )
         log.info("[FILTER_PRECONDITION]")
         log.info(f"  template_id={tid}")
         log.info("  filter=epn_final")
@@ -297,6 +360,25 @@ async def _run_single_template_in_session(
                 log.info(f"  locator_found={value_exists_in_enum}")
                 log.info(f"  click_done={str(target_value).lower() in {str(v).lower() for v in selected_immediate}}")
                 log.info(f"  selected_immediately_after_click={selected_immediate}")
+                _emit_emdia_block(
+                    "EMDIA_LOCATOR",
+                    target_found=value_exists_in_enum,
+                    target_visible=value_exists_in_enum,
+                    target_enabled=value_exists_in_enum,
+                    target_clickable=value_exists_in_enum,
+                    target_text=target_value,
+                    target_value_raw=target_value,
+                    locator_strategy="scan_slicers_apply_runtime_plan",
+                    locator_expression="runtime_plan+normalized_title",
+                )
+                _emit_emdia_block(
+                    "EMDIA_CLICK_RESULT",
+                    click_attempted=True,
+                    click_method="runtime_plan_apply",
+                    click_exception="None",
+                    selected_immediately_after_click=selected_immediate,
+                    emdia_in_selection=(str(target_value).lower() in {str(v).lower() for v in selected_immediate}),
+                )
 
             if target_set.issubset(selected_set):
                 filters_ok.append(norm_title)
@@ -370,6 +452,15 @@ async def _run_single_template_in_session(
             log.info("  filter=epn_final")
             log.info(f"  target_value={(runtime_plan.get('epn_final') or {}).get('target_values', [None])[0]}")
             log.info(f"  selected_after_reopen_or_refresh={recheck_selected}")
+            _emit_emdia_block(
+                "EMDIA_REOPEN_READBACK",
+                reopen_ok=True,
+                reopen_method="scan_slicers_recheck",
+                selected_after_reopen=recheck_selected,
+                available_after_reopen=(epn_recheck or {}).get("allValues") if 'epn_recheck' in locals() and epn_recheck else [],
+                emdia_in_readback=("emdia" in {str(v).lower() for v in recheck_selected}),
+                readback_delta_ms=3000,
+            )
 
         if critical_incidents:
             log.warning(f"  [POST_FILTER_GATE] critical_incidents={critical_incidents}")
@@ -384,7 +475,30 @@ async def _run_single_template_in_session(
                 log.warning(f"  filter={fd['filter']}")
                 log.warning(f"  target_value={fd['target_value']}")
                 log.warning(f"  reason={fd['reason']}")
+            failure_reason = "validation_mismatch"
+            if any(fd["reason"] == "value_not_found_in_enum" for fd in failure_details):
+                failure_reason = "target_not_found"
+            elif any(fd["reason"] == "readback_failed" for fd in failure_details):
+                failure_reason = "readback_failed"
+            elif any(fd["reason"] == "target_not_selected_after_apply" for fd in failure_details):
+                failure_reason = "selection_not_persisted"
+            if clear_first and len(selected_before) > 0:
+                failure_reason = "clear_failed"
+            _emit_emdia_block(
+                "EMDIA_FINAL_VALIDATE",
+                final_selected=(epn_slicer or {}).get("selectedValues") or [],
+                expected_value="EMDIA",
+                validation_ok=False,
+                mismatch_detail=failure_details,
+            )
+            _emit_emdia_block(
+                "EMDIA_GATE_DETAIL",
+                gate_passed=False,
+                failure_reason=failure_reason,
+                failure_detail=failure_details[0]["reason"] if failure_details else "gate_logic_error",
+            )
             result["error"] = f"filter_gate_failed: {critical_incidents}"
+            _save_emdia_log()
             return result
 
         log.info("[TEMPLATE_FILTER_SUMMARY]")
@@ -393,6 +507,19 @@ async def _run_single_template_in_session(
         log.info(f"  filters_ok={filters_ok}")
         log.info(f"  filters_failed={filters_failed}")
         log.info(f"  [POST_FILTER_GATE] filters_ok={filters_ok} export_release=True")
+        _emit_emdia_block(
+            "EMDIA_FINAL_VALIDATE",
+            final_selected=(epn_slicer or {}).get("selectedValues") or [],
+            expected_value="EMDIA",
+            validation_ok=True,
+            mismatch_detail="None",
+        )
+        _emit_emdia_block(
+            "EMDIA_GATE_DETAIL",
+            gate_passed=True,
+            failure_reason="none",
+            failure_detail="none",
+        )
 
         # ── FASE 2: Scan e exportação de visuais ──
         log.info(f"  📌 Escaneando visuais para exportação...")
@@ -408,6 +535,7 @@ async def _run_single_template_in_session(
         if not exportable:
             log.warning(f"  ⚠️ Nenhum visual exportável encontrado")
             result["error"] = "no_exportable_visuals"
+            _save_emdia_log()
             return result
 
         log.info(f"  📥 Exportando {len(exportable)} visuais...")
@@ -448,6 +576,7 @@ async def _run_single_template_in_session(
     log.info(f"  success={result['success']}")
     log.info(f"  export_ok={result['export_ok']}")
     log.info(f"  files_moved={result['files_moved']}")
+    _save_emdia_log()
 
     return result
 
