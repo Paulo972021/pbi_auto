@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -45,8 +46,32 @@ class L:
             f.write("\n".join(self.lines) + "\n")
 
 
-async def _activate_tab(tab, tab_name: str) -> bool:
-    return bool(await tab.evaluate(
+def _type_map(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {k: type(v).__name__ for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [type(v).__name__ for v in payload]
+    return type(payload).__name__
+
+
+async def _evaluate_logged(tab, log: L, fn_name: str, script: str, payload: Any) -> Any:
+    log.info(f"[CALL] fn={fn_name}")
+    log.info(f"[CALL] payload={payload}")
+    log.info(f"[CALL] payload_types={_type_map(payload)}")
+    log.info(f"[CDP] method=Runtime.callFunctionOn params={payload}")
+    try:
+        return await tab.evaluate(script, payload)
+    except Exception as e:
+        log.info(f"[EXCEPTION] fn={fn_name} error={e!r}")
+        log.info(f"[EXCEPTION] traceback={traceback.format_exc().strip()}")
+        raise
+
+
+async def _activate_tab(tab, log: L, tab_name: str) -> bool:
+    return bool(await _evaluate_logged(
+        tab,
+        log,
+        "_activate_tab",
         """
         (name) => {
           const norm = (s) => (s || '').trim().toLowerCase();
@@ -278,23 +303,27 @@ async def run() -> int:
         if not loaded:
             raise RuntimeError("report_not_loaded")
 
-        tab_ok = await _activate_tab(tab, TAB_NAME)
+        tab_ok = await _activate_tab(tab, log, TAB_NAME)
         log.info(f"[FASE] tab_activated={tab_ok}")
         await asyncio.sleep(1)
 
-        log.info("[SCENARIO_A] begin")
-        summary["scenario_a"] = await _run_scenario(tab, log, "SCENARIO_A", SCENARIO_A_TARGET)
-
-        # retorna topo antes do cenário B
-        for _ in range(20):
-            await _scroll_once(tab, SLICER_NAME, -abs(SCROLL_DELTA))
-            await asyncio.sleep(0.05)
-
-        log.info("[SCENARIO_B] begin")
-        summary["scenario_b"] = await _run_scenario(tab, log, "SCENARIO_B", SCENARIO_B_TARGET)
+        initial = await _read_window(tab, SLICER_NAME)
+        log.info(f"[INITIAL] slicer_name={SLICER_NAME}")
+        log.info(f"[INITIAL] snapshot_ok={initial.get('ok')} scrollTop={initial.get('scrollTop')} maxScroll={initial.get('maxScroll')}")
+        log.info(f"[INITIAL] values_now={initial.get('values')}")
+        summary["scenario_a"] = {
+            "status": "SKIPPED_TEMPORARILY_FOR_STRUCTURAL_FIX",
+            "reason": "stopped after initial slicer state capture",
+            "initial_snapshot": initial,
+        }
+        summary["scenario_b"] = {
+            "status": "SKIPPED_TEMPORARILY_FOR_STRUCTURAL_FIX",
+            "reason": "stopped after initial slicer state capture",
+        }
 
     except Exception as e:
-        log.info(f"[ERROR] {e}")
+        log.info(f"[ERROR] {e!r}")
+        log.info(f"[ERROR] traceback={traceback.format_exc().strip()}")
     finally:
         summary["timestamp_end"] = L.t()
         with open(json_path, "w", encoding="utf-8") as f:
