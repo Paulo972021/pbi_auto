@@ -9,7 +9,7 @@ Camada A (sessão): browser + aba + navegação → uma vez por página
 Camada B (execução): filtros + exportação + downloads → por template
 
 Redução de foco:
-  - safe_focus_tab chamado apenas 1x no início da sessão
+  - safe_focus_tab usado apenas como fallback
   - todas as operações subsequentes via DOM/CDP/evaluate
   - nenhum tab.activate() entre templates
 
@@ -19,9 +19,7 @@ NÃO altera: lógica de exportação, lógica de filtros, pbi_auto_v06.py
 import asyncio
 import logging
 import os
-import shutil
 import sys
-import time
 import importlib
 
 from validator import validate_template
@@ -56,6 +54,26 @@ def _import_pbi(module_name: str = "pbi_auto_v06"):
             return importlib.import_module(module_name)
         except ModuleNotFoundError:
             return None
+
+
+async def _run_with_focus_fallback(tab, pbi, stage: str, operation_name: str, operation):
+    """
+    Executa operação sem foco explícito; se falhar, aplica safe_focus_tab como fallback e tenta 1x.
+    """
+    log.info(
+        f"[FOCUS_POLICY] stage={stage} safe_focus_called=False reason={operation_name} fallback_only=True"
+    )
+    try:
+        return await operation()
+    except Exception as first_error:
+        log.warning(
+            f"[FOCUS_FALLBACK_USED] stage={stage} reason={operation_name} first_error={first_error}"
+        )
+        await pbi.safe_focus_tab(tab)
+        log.info(
+            f"[FOCUS_POLICY] stage={stage} safe_focus_called=True reason=fallback_retry:{operation_name} fallback_only=True"
+        )
+        return await operation()
 
 
 # ---------------------------------------------------------------------------
@@ -316,11 +334,9 @@ async def run_templates_for_page_in_shared_session(
       5. Fecha browser
 
     FOCUS_POLICY:
-      - safe_focus_tab chamado apenas 1x no início
-      - todas as operações por DOM/CDP/evaluate
+      - safe_focus_tab usado só em fallback
+      - operações por DOM/CDP/evaluate como caminho principal
     """
-    import tempfile
-
     pbi = _import_pbi(pbi_module_name)
     if pbi is None:
         return {"page": page, "error": f"module_not_found: {pbi_module_name}",
@@ -344,9 +360,6 @@ async def run_templates_for_page_in_shared_session(
     log.info(f"  templates_count={len(templates)}")
     log.info(f"  browser_reused=False")  # nova sessão para esta página
 
-    # ── FOCUS_POLICY: início da sessão ──
-    log.info(f"[FOCUS_POLICY] stage=session_start safe_focus_called=True reason=initial_session_setup fallback_only=False")
-
     browser = None
     tab = None
     owned_tab_refs = set()
@@ -360,11 +373,14 @@ async def run_templates_for_page_in_shared_session(
         browser, _profile_dir = await pbi.start_isolated_browser(browser_path_norm)
 
         tab = await pbi.open_report_tab(browser, url, owned_tab_refs)
-
-        # Focus ÚNICO no início da sessão
-        await pbi.safe_focus_tab(tab)
         await pbi.close_extra_tabs_created_by_script(browser, tab, owned_tab_refs)
-        await pbi.allow_multiple_downloads(tab)
+        await _run_with_focus_fallback(
+            tab,
+            pbi,
+            stage="session_start",
+            operation_name="allow_multiple_downloads",
+            operation=lambda: pbi.allow_multiple_downloads(tab),
+        )
 
         log.info(f"  ⏳ Aguardando carregamento inicial ({pbi.PAGE_LOAD_WAIT}s)...")
         await asyncio.sleep(pbi.PAGE_LOAD_WAIT)
@@ -414,7 +430,7 @@ async def run_templates_for_page_in_shared_session(
 
         previous_tid = None
 
-        for i, tpl in enumerate(templates):
+        for tpl in templates:
             tid = tpl.get("template_id", "?")
 
             # Validar
@@ -440,10 +456,12 @@ async def run_templates_for_page_in_shared_session(
                     log.warning(f"  ⚠️ Relatório instável após transição, aguardando mais...")
                     await asyncio.sleep(3)
 
-            # FOCUS_POLICY: NÃO chamar safe_focus entre templates
-            log.info(f"[FOCUS_POLICY] stage=template_{tid} safe_focus_called=False reason=reusing_session fallback_only=False")
-
-            # Executar template
+            # Executar template sem foco explícito como regra.
+            # Fallback de foco permanece disponível apenas em operações pontuais.
+            log.info(
+                f"[FOCUS_POLICY] stage=template_{tid} safe_focus_called=False "
+                f"reason=template_execution_dom_path fallback_only=True"
+            )
             tpl_result = await _run_single_template_in_session(tab, pbi, tpl, catalog)
             results.append(tpl_result)
 

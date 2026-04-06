@@ -20,6 +20,8 @@ import logging
 import os
 import sys
 import importlib
+import time
+import shutil
 
 # Pipeline imports
 from validator import validate_template
@@ -27,6 +29,60 @@ from codegen import generate_template_code
 from storage import prepare_output_folder
 
 log = logging.getLogger("executor_real")
+
+_DOWNLOAD_SETTLE_WAIT = 3.0
+
+
+def _get_downloads_folder() -> str:
+    """Retorna a pasta padrão de downloads do usuário atual."""
+    return os.path.join(os.path.expanduser("~"), "Downloads")
+
+
+def _snapshot_downloads(downloads_folder: str) -> set:
+    """Cria snapshot dos arquivos atuais da pasta de downloads."""
+    try:
+        return set(os.listdir(downloads_folder))
+    except Exception:
+        return set()
+
+
+def _detect_new_files(before_files: set, after_files: set) -> list:
+    """Detecta novos arquivos entre dois snapshots."""
+    return sorted(list(after_files - before_files))
+
+
+def _wait_for_downloads_complete(downloads_folder: str, max_wait: int = 15) -> None:
+    """
+    Aguarda término de downloads temporários (crdownload/part/tmp).
+    Mantém comportamento de exportação intacto; apenas sincroniza captura.
+    """
+    start = time.time()
+    transient_suffixes = (".crdownload", ".part", ".tmp")
+    while time.time() - start < max_wait:
+        try:
+            files = os.listdir(downloads_folder)
+        except Exception:
+            return
+        if not any(name.lower().endswith(transient_suffixes) for name in files):
+            return
+        time.sleep(0.5)
+
+
+def _move_files_to_output(new_files: list, downloads_folder: str, output_folder: str) -> list:
+    """Move arquivos novos para a pasta de saída do template."""
+    os.makedirs(output_folder, exist_ok=True)
+    moved = []
+    for name in new_files:
+        src = os.path.join(downloads_folder, name)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(output_folder, name)
+        try:
+            shutil.move(src, dst)
+            moved.append(name)
+        except Exception:
+            continue
+    return moved
 
 
 # ---------------------------------------------------------------------------
