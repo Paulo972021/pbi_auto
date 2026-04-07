@@ -13,6 +13,10 @@ Uso:
     3. (Opcional) Altere TARGET_PAGE se quiser outra aba
     4. Execute: python powerbi_export.py
 """
+# ============================================================
+# 🚀 MOTOR PRINCIPAL DE AUTOMAÇÃO POWER BI
+# Arquivo central: navegação, scan, filtros e exportação
+# ============================================================
 
 import asyncio
 import logging
@@ -38,9 +42,9 @@ except ImportError:
     print("nodriver não encontrado. Instale com: pip install nodriver")
     sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# Configuração de logging
-# ---------------------------------------------------------------------------
+# ============================================================
+# 📝 LOGGING E OBSERVABILIDADE
+# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -48,9 +52,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("powerbi_export")
 
-# ---------------------------------------------------------------------------
-# Constantes de tempo (segundos)
-# ---------------------------------------------------------------------------
+# ============================================================
+# ⚙️ CONFIGURAÇÕES DE TEMPO / RETENTATIVAS
+# ============================================================
 # Estas variáveis controlam o ritmo do script.
 # Ajuste conforme a velocidade da máquina, internet e comportamento do relatório.
 
@@ -130,9 +134,9 @@ BROWSER_PATH = getattr(configpbi, "browser", "")
 TARGET_PAGE = "COMPARATIVO"
 
 
-# ---------------------------------------------------------------------------
-# FILTER_PLAN — Plano declarativo de filtros a aplicar após enumeração
-# ---------------------------------------------------------------------------
+# ============================================================
+# 📥 PLANO DECLARATIVO DE FILTROS (FILTER_PLAN)
+# ============================================================
 # Chaves: título normalizado do slicer (lowercase, sem "(Ainda não aplicado)")
 # mode: "single" (exatamente 1 valor) | "multi" (um ou mais valores)
 # clear_first: True → limpa seleção antes de aplicar
@@ -153,9 +157,9 @@ FILTER_PLAN: dict = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# Funções auxiliares
-# ---------------------------------------------------------------------------
+# ============================================================
+# 🧩 FUNÇÕES AUXILIARES DE BASE
+# ============================================================
 
 def validate_runtime_config():
     """Valida as configurações vindas do configpbi.py."""
@@ -6630,6 +6634,9 @@ def _display_slicers_inline(slicers: list):
     print("=" * 100)
 
 
+# ============================================================
+# 📤 FLUXO PRINCIPAL DE EXECUÇÃO (run_export)
+# ============================================================
 async def run_export(url: str, browser_path: str, target_page: str, stop_after_filters: bool = False):
     log.info("🚀 Iniciando automação Power BI")
     log.info(f"📎 URL: {url}")
