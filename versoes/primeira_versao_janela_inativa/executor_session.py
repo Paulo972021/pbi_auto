@@ -15,6 +15,10 @@ Redução de foco:
 
 NÃO altera: lógica de exportação, lógica de filtros, pbi_auto_v06.py
 """
+# ============================================================
+# 🚀 EXECUTOR EM SESSÃO COMPARTILHADA
+# Reutiliza browser/aba por página e executa N templates
+# ============================================================
 
 import asyncio
 import logging
@@ -23,6 +27,9 @@ import sys
 import importlib
 from datetime import datetime, timezone
 
+# ============================================================
+# 🧩 DEPENDÊNCIAS DE ORQUESTRAÇÃO
+# ============================================================
 from validator import validate_template
 from codegen import generate_template_code
 from storage import prepare_output_folder
@@ -40,9 +47,9 @@ from executor_real import (
 log = logging.getLogger("executor_session")
 
 
-# ---------------------------------------------------------------------------
-# Importação do módulo PBI
-# ---------------------------------------------------------------------------
+# ============================================================
+# 📥 CARREGAMENTO DO MÓDULO PBI
+# ============================================================
 
 def _import_pbi(module_name: str = "pbi_auto_v06"):
     """Importa o módulo PBI com fallback de path."""
@@ -78,9 +85,9 @@ async def _run_with_focus_fallback(tab, pbi, stage: str, operation_name: str, op
         return await operation()
 
 
-# ---------------------------------------------------------------------------
-# Transição entre templates (cleanup)
-# ---------------------------------------------------------------------------
+# ============================================================
+# 🧹 TRANSIÇÃO ENTRE TEMPLATES (LIMPEZA DE UI/ESTADO)
+# ============================================================
 
 async def _template_transition_cleanup(
     tab, pbi, page: str,
@@ -162,9 +169,9 @@ async def _template_transition_cleanup(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Execução de UM template dentro de sessão existente
-# ---------------------------------------------------------------------------
+# ============================================================
+# 🧠 EXECUÇÃO UNITÁRIA DE TEMPLATE NA SESSÃO ATUAL
+# ============================================================
 
 async def _run_single_template_in_session(
     tab, pbi, template: dict, catalog: dict, transition_clean: bool = True,
