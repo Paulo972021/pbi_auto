@@ -14,6 +14,10 @@ Uso:
     from executor_real import run_template_real
     result = await run_template_real(template, catalog)
 """
+# ============================================================
+# 🚀 ORQUESTRAÇÃO DE EXECUÇÃO REAL
+# Ponte entre templates validados e o motor pbi_nico.run_export
+# ============================================================
 
 import asyncio
 import logging
@@ -23,13 +27,18 @@ import importlib
 import time
 import shutil
 
-# Pipeline imports
+# ============================================================
+# 🧩 INTEGRAÇÕES DO PIPELINE
+# ============================================================
 from validator import validate_template
 from codegen import generate_template_code
 from storage import prepare_output_folder
 
 log = logging.getLogger("executor_real")
 
+# ============================================================
+# ⚙️ CONFIGURAÇÕES DE DOWNLOAD
+# ============================================================
 _DOWNLOAD_SETTLE_WAIT = 3.0
 _DOWNLOAD_CLEAN_EXTENSIONS = {".xlsx", ".csv", ".crdownload", ".tmp"}
 
@@ -119,9 +128,10 @@ def _clean_downloads_before_template(downloads_folder: str, template_id: str) ->
     return removed
 
 
-# ---------------------------------------------------------------------------
-# Função auxiliar: converte template em FILTER_PLAN do script
-# ---------------------------------------------------------------------------
+# ============================================================
+# 🔄 TRANSFORMAÇÃO DE ENTRADA
+# Template → FILTER_PLAN consumido pelo módulo PBI
+# ============================================================
 
 def build_runtime_filter_plan_from_template(template: dict) -> dict:
     """
