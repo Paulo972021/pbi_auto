@@ -14,6 +14,7 @@ Esta pasta contém a versão integrada da feature pedida, em formato conservador
 - `docs/fluxo_geral.md`
 - `docs/microfluxos.md`
 - `docs/legenda_navegacao.md`
+- `docs/tecnologias_e_bibliotecas.md`
 - `docs/etapas_criticas/` (parte crítica)
 
 ## Uso rápido
